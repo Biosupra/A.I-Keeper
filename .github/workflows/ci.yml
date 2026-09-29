@@ -1,0 +1,19 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The guardrail tests (tests/guardrails.rs) fail the build if a signing crate enters
+      # Cargo.lock, if send/sign code appears outside src/guard.rs, or if the web client gains a
+      # write verb. They run with everything else here.
+      - run: cargo test --locked
+      - run: cargo clippy --locked -- -D warnings
