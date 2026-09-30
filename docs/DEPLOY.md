@@ -1,5 +1,13 @@
 # Deploying on Google Cloud's free tier
 
+> **Live since 2026-09-29:** project `pf-ai-keeper`, VM `aikeeper` (e2-micro, us-central1-a), service
+> account `aikeeper@pf-ai-keeper.iam.gserviceaccount.com` with `objectViewer` on `gs://pfkeeperdata`
+> only, $1 budget alert. The VM installs itself with `deploy/gce-startup.sh` (below).
+>
+> **Email:** Cloud console → Compute Engine → VM instances → `aikeeper` → Edit → Metadata → add
+> `aik-smtp-password` (the Gmail app password) → Save → Reset the VM. The startup script copies it
+> into `/etc/aikeeper.env` at every boot, so it never goes through chat or git.
+
 Target: one **e2-micro** VM in `us-central1` (Iowa), a separate Google Cloud project, a service
 account that can only **read** the keeper's bucket. About 20 minutes, mostly copy-paste.
 
