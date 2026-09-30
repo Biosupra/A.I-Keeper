@@ -13,7 +13,7 @@
 use crate::model::{exit, shadow, vol};
 use crate::store::Store;
 use anyhow::Result;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 
 pub struct MadeSummary {
@@ -343,17 +343,58 @@ pub fn grade_shadow(store: &Store, made: i64) -> Result<Option<()>> {
 }
 
 /// Result of checking the A.I's copy of the keeper's rules against what the live keeper did.
+///
+/// Rebalances are scored separately for the keeper's CURRENT rules (every run since the first one
+/// with the same major.minor version as the latest) and for older versions. The A.I copies the
+/// current rules only, so older rebalances, made under different rules, are expected to differ
+/// and are reported for reference, not as misses.
 #[derive(Debug, Default)]
 pub struct Fidelity {
     /// Width tables whose logged choice the hysteresis rule reproduces.
     pub choices: (i64, i64),
-    /// Real rebalances whose time the replay reproduces within 10 minutes.
+    /// Real rebalances under the current rules whose time the replay reproduces within 10 minutes.
     pub rebalances: (i64, i64),
     /// Logged "TWAP outside for X" clocks the A.I measures within 10 minutes.
     pub clocks: (i64, i64),
-    /// Real rebalances whose new width the rule reproduces for the position's real size.
+    /// Real rebalances under the current rules whose new width the rule reproduces for the position's real size.
     pub widths: (i64, i64),
+    /// The same two checks for rebalances made by older keeper versions (different rules).
+    pub older_rebalances: (i64, i64),
+    pub older_widths: (i64, i64),
+    /// The keeper version whose rules are current (major.minor, e.g. "0.8"), and since when.
+    pub rules_version: Option<String>,
+    pub rules_since: Option<i64>,
     pub notes: Vec<String>,
+}
+
+/// major.minor of a keeper version string ("0.8.1" -> "0.8").
+fn rules_of(version: &str) -> String {
+    version.split('.').take(2).collect::<Vec<_>>().join(".")
+}
+
+/// The keeper's current rules version and the time of the first run under it (after the last run
+/// of any other version). Runs that predate version logging count as other versions.
+pub fn current_rules(store: &Store) -> Result<Option<(String, i64)>> {
+    let runs: Vec<(i64, Option<String>)> = {
+        let mut st =
+            store.db.prepare("SELECT ts, json_extract(json, '$.keeper_version') FROM keeper_rows WHERE tbl = 'keeper_runs' ORDER BY ts")?;
+        let r = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        r.collect::<std::result::Result<_, _>>()?
+    };
+    let Some(latest) = runs.iter().rev().find_map(|(_, v)| v.clone()) else { return Ok(None) };
+    let want = rules_of(&latest);
+    let mut since: Option<i64> = None;
+    for (ts, v) in &runs {
+        match v.as_deref().map(rules_of) {
+            Some(r) if r == want => {
+                if since.is_none() {
+                    since = Some(*ts);
+                }
+            }
+            _ => since = None,
+        }
+    }
+    Ok(since.map(|s| (want, s)))
 }
 
 fn parse_dur(s: &str) -> Option<i64> {
@@ -449,6 +490,9 @@ pub fn fidelity(store: &Store) -> Result<Fidelity> {
         let r = st.query_map([], |r| r.get(0))?;
         r.collect::<std::result::Result<_, _>>()?
     };
+    let rules = current_rules(store)?;
+    f.rules_version = rules.as_ref().map(|r| r.0.clone());
+    f.rules_since = rules.as_ref().map(|r| r.1);
     let mut done = std::collections::HashSet::new();
     for e in events {
         let m = &e["meta"];
@@ -487,30 +531,56 @@ pub fn fidelity(store: &Store) -> Result<Fidelity> {
             f.notes.push(format!("rebalance at {ts}: not enough price data to replay"));
             continue;
         };
-        f.rebalances.1 += 1;
+        let current = f.rules_since.map(|since| ts >= since).unwrap_or(true);
+        let era = if current { "" } else { " [older keeper version]" };
+        if current {
+            f.rebalances.1 += 1;
+        } else {
+            f.older_rebalances.1 += 1;
+        }
         match r.actions.first() {
             Some((t, kind, to)) if (t - ts).abs() <= 600 => {
-                f.rebalances.0 += 1;
+                if current {
+                    f.rebalances.0 += 1;
+                } else {
+                    f.older_rebalances.0 += 1;
+                }
                 // The width for THIS position's size (the keeper re-scores at its real value).
                 let at = hours.iter().rposition(|h| h.table.ts <= *t).unwrap_or(0);
                 let size = m["position_usd"].as_f64().unwrap_or(0.0);
                 let sized = hours[at].table.nets_for_size(&hours[at].nets, size);
                 let sized_choice = shadow::choose(&hours[at].table, &sized, &p);
                 let opened = m["half_spacings"].as_i64().unwrap_or(-1);
-                f.widths.1 += 1;
+                let w = if current { &mut f.widths } else { &mut f.older_widths };
+                w.1 += 1;
                 if sized_choice == opened {
-                    f.widths.0 += 1;
+                    w.0 += 1;
                 }
                 f.notes.push(format!(
-                    "rebalance at {ts}: replay acted at {t} ({:+} s, {kind}); width for a ${size:.2} position {sized_choice} vs keeper {opened} (at $1,000: {to})",
+                    "rebalance at {ts}{era}: replay acted at {t} ({:+} s, {kind}); width for a ${size:.2} position {sized_choice} vs keeper {opened} (at $1,000: {to})",
                     t - ts
                 ));
             }
-            Some((t, kind, _)) => f.notes.push(format!("rebalance at {ts}: replay {kind} at {t} ({:+} min)", (t - ts) / 60)),
-            None => f.notes.push(format!("rebalance at {ts}: replay took no action")),
+            Some((t, kind, _)) => f.notes.push(format!("rebalance at {ts}{era}: replay {kind} at {t} ({:+} min)", (t - ts) / 60)),
+            None => f.notes.push(format!("rebalance at {ts}{era}: replay took no action")),
         }
     }
     Ok(f)
+}
+
+/// The model whose OWN width choices earned the most in shadow mode over `days` (at least
+/// `min_n` graded decisions): (model, decisions, mean net per day). Not the one the A.I follows:
+/// that is `champion`, chosen by forecast accuracy.
+pub fn profit_champion(store: &Store, now: i64, days: i64, min_n: i64) -> Result<Option<(String, i64, f64)>> {
+    Ok(store
+        .db
+        .query_row(
+            "SELECT model, COUNT(*), AVG(net_per_day) FROM shadow_model WHERE net_per_day IS NOT NULL AND made_ts > ?1
+             GROUP BY model HAVING COUNT(*) >= ?2 ORDER BY AVG(net_per_day) DESC LIMIT 1",
+            params![now - days * 86_400, min_n],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?)
 }
 
 pub struct ScoreLine {
@@ -674,9 +744,64 @@ mod tests {
     }
 
     #[test]
+    fn current_rules_follow_the_latest_version_and_rollbacks() {
+        let s = Store::memory().unwrap();
+        let run = |ts: i64, v: Option<&str>| {
+            let json = match v {
+                Some(v) => format!("{{\"ts\": {ts}, \"keeper_version\": \"{v}\"}}"),
+                None => format!("{{\"ts\": {ts}}}"),
+            };
+            s.db.execute(
+                "INSERT INTO keeper_rows (obj, line, tbl, ts, json) VALUES (?1, 0, 'keeper_runs', ?2, ?3)",
+                params![format!("r{ts}"), ts, json],
+            )
+            .unwrap();
+        };
+        assert_eq!(current_rules(&s).unwrap(), None, "no runs, no rules");
+        run(100, None); // before versions were logged
+        run(200, Some("0.7.0"));
+        run(300, Some("0.8.0"));
+        run(400, Some("0.8.1")); // a patch release keeps the rules
+        assert_eq!(current_rules(&s).unwrap(), Some(("0.8".into(), 300)));
+        run(500, Some("0.7.0")); // rolled back
+        run(600, Some("0.8.1")); // and forward again: the rules count from here
+        assert_eq!(current_rules(&s).unwrap(), Some(("0.8".into(), 600)));
+    }
+
+    #[test]
+    fn profit_champion_needs_enough_graded_decisions() {
+        let s = Store::memory().unwrap();
+        let now = 2_000_000;
+        for i in 0..12 {
+            s.db.execute(
+                "INSERT INTO shadow_model (made_ts, model, vol, choice, net_per_day) VALUES (?1, 'ewma', 0.004, 8, 0.002)",
+                [now - 1000 - i],
+            )
+            .unwrap();
+            s.db.execute(
+                "INSERT INTO shadow_model (made_ts, model, vol, choice, net_per_day) VALUES (?1, 'keeper', 0.005, 16, 0.0004)",
+                [now - 1000 - i],
+            )
+            .unwrap();
+        }
+        // A model with a better mean but only 3 decisions does not count.
+        for i in 0..3 {
+            s.db.execute(
+                "INSERT INTO shadow_model (made_ts, model, vol, choice, net_per_day) VALUES (?1, 'lucky', 0.003, 4, 0.05)",
+                [now - 1000 - i],
+            )
+            .unwrap();
+        }
+        let (m, n, mean) = profit_champion(&s, now, 30, 10).unwrap().unwrap();
+        assert_eq!((m.as_str(), n), ("ewma", 12));
+        assert!((mean - 0.002).abs() < 1e-12);
+        assert_eq!(profit_champion(&s, now, 30, 20).unwrap(), None);
+    }
+
+    #[test]
     fn migrations_add_missing_columns() {
         let db = rusqlite::Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE pool_obs (ts INTEGER PRIMARY KEY); CREATE TABLE shadow (made_ts INTEGER PRIMARY KEY); CREATE TABLE shadow_model (made_ts INTEGER, model TEXT);").unwrap();
+        db.execute_batch("CREATE TABLE pool_obs (ts INTEGER PRIMARY KEY); CREATE TABLE shadow (made_ts INTEGER PRIMARY KEY); CREATE TABLE shadow_model (made_ts INTEGER, model TEXT); CREATE TABLE price_1m (source TEXT, ts INTEGER, close REAL);").unwrap();
         crate::store::migrate(&db).unwrap();
         crate::store::migrate(&db).unwrap(); // idempotent
         let cols = |t: &str| -> Vec<String> {
@@ -686,5 +811,10 @@ mod tests {
         assert!(cols("pool_obs").contains(&"reward_rate".to_string()));
         assert!(cols("shadow").contains(&"replay".to_string()) && cols("shadow").contains(&"best_net".to_string()));
         assert!(cols("shadow_model").contains(&"replay".to_string()));
+        // Full capture (2026-09-30): an old database gains the new columns too.
+        for c in ["staked_liquidity", "aero_weth_tick", "aero_usd", "reward_reserve", "period_finish", "gauge_fees0", "gauge_fees1"] {
+            assert!(cols("pool_obs").contains(&c.to_string()), "{c}");
+        }
+        assert!(cols("price_1m").contains(&"volume".to_string()));
     }
 }

@@ -11,17 +11,23 @@ CI, not left to good behaviour — see [docs/GUARDRAILS.md](docs/GUARDRAILS.md).
 
 | Every… | It… |
 |---|---|
-| 30 s | reads the Panda pool on Base: price, liquidity, swap fee, gas, AERO emission rate |
-| 1 min | stores ETH-USD's one-minute price from Coinbase |
-| 1 h | stores Deribit's DVOL (what the options market expects ETH's volatility to be) |
+| 30 s | reads the Panda pool on Base: price, liquidity, **staked** liquidity, swap fee, gas, AERO emission rate, and the AERO price |
+| 30 s | records **every event** the pool and its gauge emit: every swap (decoded), every other LP's range opened or closed, every NFT staked or unstaked, every reward claim (~150,000 events a day, all archived) |
+| 1 min | stores one-minute prices with volume from Coinbase: ETH-USD, BTC-USD, AERO-USD, ETH-BTC |
+| 5 min | the ETH-USD order book (spread, depth each side) and the ETH and BTC perpetuals on Deribit (funding, open interest) |
+| 10 min | the **liquidity map** around the price: total and staked liquidity at every price level within ±20% |
+| 15 min | crypto headlines from five news feeds (kept as published; tagging them comes later) |
+| 30 min | reads **every file** the keeper writes to its history bucket (read-only), archives it byte for byte, and decodes each position's value and earnings minute by minute, every decision and every width table |
+| 1 h | Deribit's DVOL for ETH and BTC, the whole ETH option board, the gauge's emission schedule, the pool's share of the Aerodrome vote, the keeper wallet's ETH |
 | 1 h | checks the website and the keeper's deposit-width feed (GET only) |
+| 6 h | the yields of every Aerodrome pool on Base (DefiLlama) and the Crypto Fear & Greed index |
 | 1 h | **forecasts** ETH volatility (next hour, next day) with six models, and the chance the price leaves each range width (±1% … ±8%) within a day |
-| 6 h | reads the keeper's history bucket (read-only) and, for every keeper width decision, makes **its own choice** — shadow mode |
+| 30 min | for every keeper width decision, makes **its own choice** — shadow mode |
 | 10 min | **grades** every forecast and shadow decision whose time has come, against the real price path |
 | 10 min | **alerts** you by email the moment something matters: keeper stopped, keeper gas low, site down, keeper stuck or hitting its runaway guard, the keeper's rules changed, or the A.I's own feeds failing |
 | 10 min | reads **your replies** to the brief (read-only) and keeps them as notes with that day's decisions |
 | night | refits its volatility model on all the history it holds |
-| day | emails the brief: market, keeper activity, A.I vs keeper, scorecard, health, your notes |
+| day | emails the brief: markets, the pool (flow, competing LPs, staking, emissions, the liquidity map), keeper activity, A.I vs keeper, scorecard, headlines, what it captured, health, your notes |
 
 ### How it learns
 Every forecast goes into a registry with the time it can be checked. When that time comes, the A.I
@@ -59,8 +65,10 @@ aikeeper inbox               # read replies to the brief now (read-only)
 
 Google Cloud's always-free tier: one e2-micro VM (1 GB RAM — which is why it is written in Rust)
 and a 30 GB disk. The keeper's bucket is US multi-region, which the free Storage allowance does not
-cover, so its reads cost about **$0.003 a month** (budgeted in `src/collect/bucket.rs`); a $1 budget
-alert watches the project. Email goes out through Gmail with an app password. Step by step:
+cover; reading every file it writes costs about **$0.20 a month** (see `src/collect/bucket.rs`),
+and a $1 budget alert watches the project. Everything else it reads is free. The database grows by
+roughly 10–15 GB a year, so the disk lasts about two years; an `ai-disk` alert fires at 80% of
+`AIK_DISK_BUDGET_GB` (20 GB), long before it is full. Email goes out through Gmail with an app password. Step by step:
 [docs/DEPLOY.md](docs/DEPLOY.md).
 
 ## Status

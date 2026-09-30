@@ -20,7 +20,7 @@ mod store;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use collect::{bucket, chain, market, site};
+use collect::{bucket, chain, flow, liquidity, market, news, site};
 
 #[derive(Parser)]
 #[command(name = "aikeeper", version, about = "Panda Financial A.I Keeper (watch-only)")]
@@ -35,13 +35,18 @@ enum Cmd {
     Run,
     /// Check the guardrails and read once from every source. Writes nothing outside the data dir.
     Selftest,
-    /// Fill history: a year of ETH minutes, DVOL, and the keeper's bucket since its first day.
+    /// Fill history: a year of ETH, BTC, AERO and ETH-BTC minutes, DVOL (ETH and BTC), Fear & Greed,
+    /// every file in the keeper's bucket since its first day, and every pool/gauge event since the
+    /// vault's deploy block. Safe to run again: whatever is already held is skipped.
     Backfill {
         #[arg(long, default_value_t = 365)]
         days: i64,
         /// Skip the keeper bucket (e.g. on a laptop without access).
         #[arg(long)]
         no_bucket: bool,
+        /// Skip the pool/gauge event history (it reads ~400 block ranges from Base's public node).
+        #[arg(long)]
+        no_chain: bool,
     },
     /// Make this hour's forecasts and shadow rows now.
     Predict,
@@ -79,7 +84,7 @@ async fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Run => run::daemon(cfg).await,
         Cmd::Selftest => selftest(&cfg, t).await,
-        Cmd::Backfill { days, no_bucket } => backfill(&cfg, t, days, no_bucket).await,
+        Cmd::Backfill { days, no_bucket, no_chain } => backfill(&cfg, t, days, no_bucket, no_chain).await,
         Cmd::Predict => {
             let s = store::Store::open(&cfg.db_path())?;
             let m = registry::make_predictions(&s, t)?;
@@ -131,8 +136,16 @@ async fn main() -> Result<()> {
             let f = registry::fidelity(&s)?;
             println!("width choices reproduced:   {} of {}", f.choices.0, f.choices.1);
             println!("out-of-range clocks within 10 min: {} of {}", f.clocks.0, f.clocks.1);
-            println!("real rebalances reproduced within 10 min: {} of {}", f.rebalances.0, f.rebalances.1);
+            match (&f.rules_version, f.rules_since) {
+                (Some(v), Some(since)) => println!("current rules: keeper {v}.x, since {}", brief::when(since)),
+                _ => println!("current rules: unknown (no versioned keeper run in the history yet)"),
+            }
+            println!("real rebalances under the current rules reproduced within 10 min: {} of {}", f.rebalances.0, f.rebalances.1);
             println!("their new widths reproduced (at the real position size): {} of {}", f.widths.0, f.widths.1);
+            println!(
+                "older keeper versions (different rules, for reference): {} of {} times, {} of {} widths",
+                f.older_rebalances.0, f.older_rebalances.1, f.older_widths.0, f.older_widths.1
+            );
             for n in f.notes {
                 println!("  {n}");
             }
@@ -206,6 +219,49 @@ async fn selftest(cfg: &config::Config, t: i64) -> Result<()> {
         Ok(n) => println!("  Deribit DVOL   {n} hourly points"),
         Err(e) => println!("  Deribit DVOL   FAILED: {e:#}"),
     }
+    match market::deribit_dvol_for(&web, &s, "BTC", t - 6 * 3600, t).await {
+        Ok(n) => println!("  Deribit BTC    {n} hourly DVOL points"),
+        Err(e) => println!("  Deribit BTC    FAILED: {e:#}"),
+    }
+    match market::perps(&web, &s, t).await {
+        Ok(n) => println!("  Deribit perps  {n} values (funding, open interest, mark, index)"),
+        Err(e) => println!("  Deribit perps  FAILED: {e:#}"),
+    }
+    match market::options(&web, &s, t).await {
+        Ok(n) => println!("  ETH options    {n} instruments"),
+        Err(e) => println!("  ETH options    FAILED: {e:#}"),
+    }
+    match market::book(&web, &s, t).await {
+        Ok(()) => println!("  Coinbase book  spread and depth stored"),
+        Err(e) => println!("  Coinbase book  FAILED: {e:#}"),
+    }
+    match market::pool_yields(&web, &s, t).await {
+        Ok(n) => println!("  DefiLlama      {n} Aerodrome pools on Base"),
+        Err(e) => println!("  DefiLlama      FAILED: {e:#}"),
+    }
+    match market::fear_greed(&web, &s, 2).await {
+        Ok(n) => println!("  Fear & Greed   {n} days"),
+        Err(e) => println!("  Fear & Greed   FAILED: {e:#}"),
+    }
+    match news::poll(&web, &s, t).await {
+        Ok((feeds, n)) => println!("  News           {feeds} of {} feeds read, {n} new headlines", news::FEEDS.len()),
+        Err(e) => println!("  News           FAILED: {e:#}"),
+    }
+    match flow::head(&rpc).await {
+        Ok(h) => match flow::backfill(&rpc, &s, &cfg.pool, &cfg.gauge, h - 60, h - 3).await {
+            Ok(x) => println!("  Pool events    {} logs ({} swaps) in the last ~2 minutes of blocks", x.logs, x.swaps),
+            Err(e) => println!("  Pool events    FAILED: {e:#}"),
+        },
+        Err(e) => println!("  Pool events    FAILED: {e:#}"),
+    }
+    match liquidity::snapshot_ticks(&rpc, &s, &cfg.pool, t).await {
+        Ok(n) => println!("  Liquidity map  {n} initialized ticks within ±20%"),
+        Err(e) => println!("  Liquidity map  FAILED: {e:#}"),
+    }
+    match liquidity::snapshot_emissions(&rpc, &s, &cfg.pool, &cfg.gauge, t).await {
+        Ok(n) => println!("  Emissions/vote {n} values"),
+        Err(e) => println!("  Emissions/vote FAILED: {e:#}"),
+    }
     match site::check_all(&web, &s, &cfg.site, t).await {
         Ok(cs) => {
             for c in cs {
@@ -229,21 +285,44 @@ async fn selftest(cfg: &config::Config, t: i64) -> Result<()> {
     Ok(())
 }
 
-async fn backfill(cfg: &config::Config, t: i64, days: i64, no_bucket: bool) -> Result<()> {
+async fn backfill(cfg: &config::Config, t: i64, days: i64, no_bucket: bool, no_chain: bool) -> Result<()> {
     let s = store::Store::open(&cfg.db_path())?;
     let web = net::Web::new()?;
+    let rpc = net::Rpc::new(cfg.rpc_urls.clone())?;
     println!("Coinbase: filling {days} days of one-minute ETH-USD (about {} requests)...", days * 1440 / 300);
     println!("  {} candles stored", market::coinbase_backfill(&web, &s, t, days).await?);
+    for p in market::EXTRA_PRODUCTS {
+        match market::backfill_product(&web, &s, p, t, days).await {
+            Ok(n) => println!("Coinbase {p}: {n} candles stored"),
+            Err(e) => println!("Coinbase {p}: {e:#}"),
+        }
+    }
     println!("Deribit DVOL: {} hourly points", market::deribit_dvol(&web, &s, t - days * 86_400, t).await.unwrap_or(0));
+    println!("Deribit BTC DVOL: {} hourly points", market::deribit_dvol_for(&web, &s, "BTC", t - days * 86_400, t).await.unwrap_or(0));
+    println!("Fear & Greed: {} days", market::fear_greed(&web, &s, days.clamp(1, 3650) as u32).await.unwrap_or(0));
     if !no_bucket {
         if let Some(name) = &cfg.bucket {
             let b = bucket::Bucket { web: &web, name: name.clone(), token: cfg.gcs_token.clone() };
             let days = bucket::days_between(&cfg.bucket_start, t);
-            println!("Keeper bucket: {} days from {} (price history in full, the rest hourly)...", days.len(), cfg.bucket_start);
+            println!("Keeper bucket: {} days from {} (every file archived and decoded)...", days.len(), cfg.bucket_start);
             let (o, r) = bucket::sync_days(&b, &s, &days, bucket::Mode::History).await?;
             println!("  {o} files, {r} rows");
         }
     }
+    if !no_chain {
+        let head = flow::head(&rpc).await? - 3;
+        println!("Pool and gauge events: blocks {}..{} (every range not yet archived)...", cfg.chain_start_block, head);
+        match flow::backfill(&rpc, &s, &cfg.pool, &cfg.gauge, cfg.chain_start_block, head).await {
+            Ok(x) => println!("  {} logs, {} swaps", x.logs, x.swaps),
+            Err(e) => println!("  stopped early: {e:#}"),
+        }
+    }
+    // Take the snapshots now so the first brief has them.
+    let _ = market::pool_yields(&web, &s, t).await.map(|n| println!("DefiLlama: {n} Aerodrome pools"));
+    let _ = market::options(&web, &s, t).await.map(|n| println!("ETH options: {n} instruments"));
+    let _ = liquidity::snapshot_ticks(&rpc, &s, &cfg.pool, t).await.map(|n| println!("Liquidity map: {n} ticks"));
+    let _ = liquidity::snapshot_emissions(&rpc, &s, &cfg.pool, &cfg.gauge, t).await.map(|n| println!("Emissions/vote: {n} values"));
+    let _ = news::poll(&web, &s, t).await.map(|(f, n)| println!("News: {n} headlines from {f} feeds"));
     match model::har::refit(&s, t)? {
         Some(h) => println!("HAR fitted on {} days: {:?}", h.n, h),
         None => println!("HAR: not enough history yet"),

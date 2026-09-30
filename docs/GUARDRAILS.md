@@ -25,9 +25,11 @@ what the program **can** do, and CI fails the build if any of it erodes.
 
 ## 3. It can only talk to known places, and only to read
 
-* Every web request passes `guard::check_host`: Base public RPCs, Coinbase, Deribit, Google Cloud
-  Storage (+ the VM token endpoint) and pandafinancial.org. Railway, Cloudflare's API, GitHub's API
-  and Alchemy are explicitly denied.
+* Every web request passes `guard::check_host`: Base public RPCs, Coinbase, Deribit, DefiLlama's
+  yields API, the Fear & Greed API, five news feeds (CoinDesk, Cointelegraph, Decrypt, The Block,
+  The Defiant), Google Cloud Storage (+ the VM token endpoint) and pandafinancial.org. Each host is
+  named exactly (a look-alike subdomain is refused). Railway, Cloudflare's API, GitHub's API and
+  Alchemy are explicitly denied.
 * The web client exposes **GET only**. The one POST in the program is the JSON-RPC client above,
   and CI checks that `src/net.rs` has exactly one `.post(` and that it calls the allowlist. No other
   file may build its own HTTP client.

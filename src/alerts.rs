@@ -12,7 +12,8 @@
 //! * the keeper's own history: no new rows for 3 hours while the A.I is reading the bucket fine;
 //! * the keeper's decisions: a runaway-guard skip, or a position left out of range past the crash
 //!   valve's 24-hour cap;
-//! * the A.I itself: its Base reads, its market data, or its bucket access stalling;
+//! * the A.I itself: its Base reads, its pool-event feed, its liquidity map, its market data or its
+//!   bucket access stalling, and its database approaching the disk budget;
 //! * rule drift: the keeper choosing a width the A.I's copy of its rules would not (its rules have
 //!   changed and the shadow replay needs updating).
 
@@ -91,19 +92,24 @@ pub async fn evaluate(cfg: &Config, store: &Store, web: &Web, rpc: &Rpc, now: i6
         }
     }
 
-    // The keeper's own history, the A.I's own feeds.
-    let newest_keeper: Option<i64> =
-        store.db.query_row("SELECT MAX(ts) FROM keeper_rows WHERE tbl IN ('width_evals', 'keeper_decisions')", [], |r| r.get(0))?;
+    // The keeper's own history, the A.I's own feeds. The keeper writes every minute; the A.I now
+    // reads every file (width_min, decision_min), so the newest of those is the freshest signal.
+    let newest_keeper: Option<i64> = store.db.query_row(
+        "SELECT MAX(t) FROM (SELECT MAX(ts) AS t FROM keeper_rows WHERE tbl IN ('width_evals', 'keeper_decisions')
+                             UNION ALL SELECT MAX(ts) FROM width_min UNION ALL SELECT MAX(ts) FROM decision_min)",
+        [],
+        |r| r.get(0),
+    )?;
     let bucket_ok: i64 = store.meta_get("bucket_ok_ts")?.and_then(|v| v.parse().ok()).unwrap_or(0);
     if cfg.bucket.is_some() {
-        if bucket_ok > 0 && now - bucket_ok > 13 * 3600 {
+        if bucket_ok > 0 && now - bucket_ok > 3 * 3600 {
             out.push(f(
                 "ai-bucket",
                 format!("The A.I has not been able to read the keeper's history bucket for {} hours.", (now - bucket_ok) / 3600),
             ));
         }
         if let Some(n) = newest_keeper {
-            // Only meaningful right after a successful sync: the bucket is read every 6 h.
+            // Only meaningful right after a successful sync: the bucket is read every 30 minutes.
             if bucket_ok > n && bucket_ok - n > 3 * 3600 {
                 out.push(f("keeper-history", format!(
                     "The keeper's newest history row is {} hours older than the A.I's last successful read: the keeper has stopped writing its log (it writes every minute).",
@@ -120,9 +126,34 @@ pub async fn evaluate(cfg: &Config, store: &Store, web: &Web, rpc: &Rpc, now: i6
     if last_coin.map(|t| now - t > 45 * 60).unwrap_or(false) {
         out.push(f("ai-market", "The A.I has had no Coinbase ETH prices for over 45 minutes.".into()));
     }
+    // The pool trades every few seconds, so 30 minutes without a recorded swap means the event feed stalled.
+    let last_swap: Option<i64> = store.db.query_row("SELECT MAX(ts) FROM swaps", [], |r| r.get(0))?;
+    if last_swap.map(|t| now - t > 30 * 60).unwrap_or(false) {
+        out.push(f("ai-flow", "The A.I has recorded no pool events for over 30 minutes (its public RPC log reads are failing).".into()));
+    }
+    let last_map: Option<i64> = store.db.query_row("SELECT MAX(ts) FROM tick_liquidity", [], |r| r.get(0))?;
+    if last_map.map(|t| now - t > 2 * 3600).unwrap_or(false) {
+        out.push(f("ai-liquidity-map", "The A.I's liquidity map of the pool is over 2 hours old (taken every 10 minutes).".into()));
+    }
+    // The database against its disk budget (the VM's disk is 30 GB; the rest is the system).
+    let db_bytes: u64 =
+        ["", "-wal"].iter().filter_map(|sfx| std::fs::metadata(format!("{}{sfx}", cfg.db_path().display())).ok()).map(|m| m.len()).sum();
+    let budget = cfg.disk_budget_gb * 1e9;
+    if budget > 0.0 && db_bytes as f64 > 0.8 * budget {
+        out.push(f("ai-disk", format!(
+            "The A.I's database is {:.1} GB, over 80% of its {:.0} GB budget. Grow the VM disk (about $0.04 per GB a month) or raise AIK_DISK_BUDGET_GB.",
+            db_bytes as f64 / 1e9, cfg.disk_budget_gb
+        )));
+    }
 
-    // Keeper decisions ingested in the last day: runaway guard, valve cap exceeded.
-    let mut st = store.db.prepare("SELECT json FROM keeper_rows WHERE tbl = 'keeper_decisions' AND ts > ?1")?;
+    // Keeper decisions of the last day (every one, from decision_min, plus the older sampled rows):
+    // runaway guard, valve cap exceeded.
+    let mut st = store.db.prepare(
+        "SELECT json FROM keeper_rows WHERE tbl = 'keeper_decisions' AND ts > ?1
+         UNION ALL
+         SELECT json_object('token_id', token_id, 'decision', decision, 'reason', reason, 'outside_secs', outside_secs)
+           FROM decision_min WHERE ts > ?1",
+    )?;
     let decisions: Vec<Value> = st
         .query_map([now - 86_400], |r| r.get::<_, String>(0))?
         .filter_map(|r| r.ok())

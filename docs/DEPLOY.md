@@ -16,9 +16,10 @@ account that can only **read** the keeper's bucket. About 20 minutes, mostly cop
 | Item | Cost |
 |---|---|
 | e2-micro VM + 30 GB standard disk, us-central1 | always-free tier (1 per billing account) |
-| Reading `gs://pfkeeperdata` | the bucket is **US multi-region**, which the free Storage allowance does not cover (it covers us-east1/us-west1/us-central1 only). At $0.0004 per 1,000 reads: about **$0.003 a month** live (width tables every 10 minutes, see `src/collect/bucket.rs`) and **~$0.01 once** for the history backfill. Transfer US → us-central1 is free. |
+| Reading `gs://pfkeeperdata` | the bucket is **US multi-region**, which the free Storage allowance does not cover (it covers us-east1/us-west1/us-central1 only). Every file the keeper writes is read once: ~4,000 reads a day ($0.0004 per 1,000) and ~500 lists a day ($0.01 per 1,000), about **$0.20 a month**, plus **~$0.03 once** for the history backfill. Transfer US → us-central1: at most a cent a month (~16 MB a day). |
+| Disk | the database grows ~10–15 GB a year (compressed archives of every keeper file and every pool event, plus decoded tables); the free 30 GB disk lasts about two years. The `ai-disk` alert fires at 80% of `AIK_DISK_BUDGET_GB` (20 GB). Growing the disk later costs about $0.04 per GB a month. |
 | VM external IPv4 address | **Not confirmed.** Google's free-tier page does not say either way; if charged it is about $0.005/hour. The $1 budget alert below will tell you within days. |
-| Coinbase, Deribit, Base public RPC, Gmail | free |
+| Coinbase, Deribit, DefiLlama, Fear & Greed, news feeds, Base public RPC, Gmail | free |
 
 Set the budget alert first (step 2) so any surprise shows up as an email, not a bill.
 

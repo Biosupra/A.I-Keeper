@@ -75,6 +75,8 @@ impl Rpc {
     }
 
     /// Several read-only calls in one HTTP request (JSON-RPC batch); results in request order.
+    /// An endpoint that answers some calls with errors (public nodes rate-limit inside a batch) is
+    /// not the last word: the next endpoint is tried, and the answer with the fewest errors wins.
     pub async fn batch(&self, calls: &[(&str, Value)]) -> Result<Vec<Result<Value>>> {
         for (m, _) in calls {
             guard::check_rpc_method(m)?;
@@ -82,6 +84,7 @@ impl Rpc {
         let body: Vec<Value> =
             calls.iter().enumerate().map(|(i, (m, p))| json!({"jsonrpc": "2.0", "id": i, "method": m, "params": p})).collect();
         let mut last_err = anyhow!("no endpoint answered");
+        let mut best: Option<(usize, Vec<Result<Value>>)> = None;
         for url in &self.urls {
             guard::check_host(url)?;
             match self.client.post(url).json(&body).send().await {
@@ -98,7 +101,13 @@ impl Rpc {
                                 };
                             }
                         }
-                        return Ok(out);
+                        let errors = out.iter().filter(|r| r.is_err()).count();
+                        if errors == 0 {
+                            return Ok(out);
+                        }
+                        if best.as_ref().map(|(e, _)| errors < *e).unwrap_or(true) {
+                            best = Some((errors, out));
+                        }
                     }
                     Ok(other) => last_err = anyhow!("{url}: unexpected reply {}", other.to_string().chars().take(200).collect::<String>()),
                     Err(e) => last_err = anyhow!("{url}: {e}"),
@@ -107,6 +116,9 @@ impl Rpc {
                 Err(e) => last_err = anyhow!("{url}: {e}"),
             }
         }
-        Err(last_err)
+        match best {
+            Some((_, out)) => Ok(out),
+            None => Err(last_err),
+        }
     }
 }

@@ -44,6 +44,15 @@ pub const ALLOWED_HOSTS: &[&str] = &[
     // Market data (public, no key).
     "api.exchange.coinbase.com",
     "www.deribit.com",
+    // Yields of every Aerodrome pool (DefiLlama) and the Crypto Fear & Greed index (public, no key).
+    "yields.llama.fi",
+    "api.alternative.me",
+    // Crypto headlines (public RSS feeds, GET only).
+    "www.coindesk.com",
+    "cointelegraph.com",
+    "decrypt.co",
+    "www.theblock.co",
+    "thedefiant.io",
     // The keeper's history bucket (read-only service account) and the VM's token endpoint.
     "storage.googleapis.com",
     "metadata.google.internal",
@@ -166,6 +175,27 @@ mod tests {
         assert!(check_host("https://pandafinancial.org.evil.com/").is_err());
         assert!(check_host("https://user:pw@mainnet.base.org:443/x").is_ok());
         assert!(check_host("ftp://mainnet.base.org").is_err());
+        // Full capture sources, and nothing that merely resembles them.
+        for u in [
+            "https://yields.llama.fi/pools",
+            "https://api.alternative.me/fng/",
+            "https://www.coindesk.com/arc/outboundfeeds/rss/",
+            "https://cointelegraph.com/rss",
+            "https://decrypt.co/feed",
+            "https://www.theblock.co/rss.xml",
+            "https://thedefiant.io/api/feed",
+        ] {
+            assert!(check_host(u).is_ok(), "{u}");
+        }
+        assert!(check_host("https://api.llama.fi/protocols").is_err(), "only the yields host");
+        assert!(check_host("https://evil.decrypt.co/feed").is_err());
+    }
+
+    #[test]
+    fn every_collector_url_passes_the_guard() {
+        for (_, u) in crate::collect::news::FEEDS {
+            assert!(check_host(u).is_ok(), "{u}");
+        }
     }
 
     #[test]

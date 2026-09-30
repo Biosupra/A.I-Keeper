@@ -42,6 +42,10 @@ pub struct Config {
     pub bucket_poll_secs: u64,
     pub site_poll_secs: u64,
     pub predict_every_secs: u64,
+    /// Disk the database may use before the ai-disk alert (GB; the VM disk is 30 GB).
+    pub disk_budget_gb: f64,
+    /// First block of pool/gauge history the backfill reads (the vault's deploy block).
+    pub chain_start_block: i64,
 }
 
 impl Config {
@@ -78,9 +82,12 @@ impl Config {
             brief_hour_utc: num("AIK_BRIEF_HOUR_UTC", 12),
             chain_poll_secs: num("AIK_CHAIN_POLL_SECS", 30),
             market_poll_secs: num("AIK_MARKET_POLL_SECS", 60),
-            bucket_poll_secs: num("AIK_BUCKET_POLL_SECS", 6 * 3600),
+            // Every 30 minutes: every file the keeper writes is read (once) and archived.
+            bucket_poll_secs: num("AIK_BUCKET_POLL_SECS", 1800),
             site_poll_secs: num("AIK_SITE_POLL_SECS", 3600),
             predict_every_secs: num("AIK_PREDICT_EVERY_SECS", 3600),
+            disk_budget_gb: num("AIK_DISK_BUDGET_GB", 20.0),
+            chain_start_block: num("AIK_CHAIN_START_BLOCK", 51_189_251),
         }
     }
 

@@ -2,19 +2,32 @@
 
 ## Data
 
+Everything is read-only, free public sources except the keeper's bucket (read-only, ~$0.20 a month).
+Since 2026-09-30 it captures everything it can ("watch EVERYTHING"):
+
 | Source | What | How often | Where it goes |
 |---|---|---|---|
-| Panda pool on Base (`mainnet.base.org`, fallbacks) | tick, sqrtPrice, liquidity, `fee()`, base fee, gauge `rewardRate()` | 30 s | `pool_obs`, `price_1m` (source `pool`) |
-| Coinbase Exchange | ETH-USD one-minute candles | 1 min (+ a year of backfill) | `price_1m` (source `coinbase`) |
-| Deribit | ETH DVOL (options-implied volatility) | 1 h | `dvol` |
-| Keeper bucket `gs://pfkeeperdata` | the keeper's six history tables, verbatim | 6 h (lean) | `keeper_rows` |
+| Panda pool on Base (`mainnet.base.org`, fallbacks) | tick, sqrtPrice, liquidity, **stakedLiquidity**, `fee()`, base fee, gauge `rewardRate()`, AERO/WETH pool tick (AERO price) | 30 s | `pool_obs`, `price_1m` (source `pool`) |
+| Pool + gauge event logs (`src/collect/flow.rs`) | every log, gzipped as received (~8 MB a day); swaps decoded; Mint/Burn/Collect/CollectFees/Flash and gauge stake/unstake/claim/notify/penalty summed per minute | 30 s (cursor; up to 3 × 1,999 blocks per turn; full history since the vault's deploy block by `backfill`) | `chain_log_archive`, `swaps`, `lp_minute`, `gauge_minute` |
+| Pool `ticks()` (`src/collect/liquidity.rs`) | gross, net and **staked** net liquidity of every initialized tick within ±40 spacings (±20%) | 10 min | `tick_liquidity` |
+| Gauge, pool, Voter | periodFinish, left, rewardRateByEpoch, fees, rewardReserve, gaugeFees, the pool's vote weight and the total; the keeper wallet's ETH | 1 h | `series` (sources `gauge`, `keeper`) |
+| Coinbase Exchange | one-minute candles with volume: ETH-USD, BTC-USD, AERO-USD, ETH-BTC | 1 min (+ a year of backfill) | `price_1m` (sources `coinbase`, `cb:<product>`) |
+| Coinbase Exchange | ETH-USD order book: mid, spread, depth and imbalance within 0.1/0.5/1/2% | 5 min | `series` (`coinbase_book`) |
+| Deribit | ETH DVOL; BTC DVOL; ETH and BTC perpetual funding, open interest, mark, index, 24 h volume; every ETH option's IV, price, open interest | 1 h / 5 min / 1 h | `dvol`, `series` (`deribit`), `options_hourly` |
+| DefiLlama yields | TVL, APY (base, reward), volume of every Aerodrome pool on Base | 6 h | `pool_yields` |
+| alternative.me | Crypto Fear & Greed index | 6 h | `series` (`alternative`) |
+| News RSS (CoinDesk, Cointelegraph, Decrypt, The Block, The Defiant) | headline, link, time, summary | 15 min | `news` |
+| Keeper bucket `gs://pfkeeperdata` | **every file** of its six tables, byte for byte; each position every minute, every decision, every width table, the keeper's market row, decoded | 30 min (own thread) | `bucket_archive`, `position_min`, `decision_min`, `width_min`, `keeper_market_min`, and `keeper_rows` for the replay |
 | pandafinancial.org | 8 pages / read-only API routes, status + latency, width-feed age | 1 h | `site_checks` |
+
+Every network job runs under a hard time limit, and the bucket sync on its own thread, so no source
+can stall the others (`src/run.rs`).
 
 `fee()` on the pool is the pool's own fee; the keeper's `fee_pips` is the dynamic fee it reads
 elsewhere, so the two can differ.
 
-Bucket budget: see the comment at the top of `src/collect/bucket.rs` — about 1,500 reads and 1,500
-lists a month live, a one-time ~22,000 reads for the price history, all inside the free tier.
+Bucket cost: see the comment at the top of `src/collect/bucket.rs` — about 4,000 reads and 500
+lists a day, roughly $0.20 a month, and ~$0.03 once for the first fortnight's files.
 
 ## Forecasts (`src/model`, `src/registry.rs`)
 

@@ -72,6 +72,104 @@ CREATE TABLE IF NOT EXISTS alerts (ts INTEGER NOT NULL, key TEXT NOT NULL, state
 
 -- Fitted model parameters and small bits of state.
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+
+-- ===== Full capture (2026-09-30: "watch EVERYTHING") =====
+
+-- Every file the keeper writes to its history bucket, byte for byte (gzipped JSONL, as stored).
+CREATE TABLE IF NOT EXISTS bucket_archive (obj TEXT PRIMARY KEY, tbl TEXT NOT NULL, ts INTEGER NOT NULL, bytes INTEGER NOT NULL, gz BLOB NOT NULL);
+CREATE INDEX IF NOT EXISTS bucket_archive_tbl_ts ON bucket_archive (tbl, ts);
+
+-- One row per position per keeper snapshot (every minute): the numbers that say how each position is doing.
+CREATE TABLE IF NOT EXISTS position_min (
+  token_id INTEGER NOT NULL, ts INTEGER NOT NULL, origin_token_id INTEGER, position_usd REAL, hodl_usd REAL,
+  value_minus_hodl_usd REAL, value_plus_returns_minus_hodl_usd REAL, earned_aero_user REAL, paid_aero_cum REAL,
+  paid_usdc_cum REAL, returned_usd REAL, in_range INTEGER, tick_lower INTEGER, tick_upper INTEGER, half_spacings INTEGER,
+  decision TEXT, reason TEXT, outside_secs INTEGER, hold_secs INTEGER, recut_wait TEXT, width_best_hs INTEGER,
+  width_best_net REAL, width_current_net REAL, liquidity TEXT,
+  PRIMARY KEY (token_id, ts)
+);
+CREATE INDEX IF NOT EXISTS position_min_ts ON position_min (ts);
+
+-- One row per keeper width table (every minute): what it chose and the whole scored table.
+CREATE TABLE IF NOT EXISTS width_min (
+  ts INTEGER PRIMARY KEY, choice INTEGER, vol REAL, vol_short REAL, vol_long REAL, rate_per_l REAL, gas_usd REAL,
+  weth_usd REAL, current_tick INTEGER, coverage_secs INTEGER, table_json TEXT
+);
+
+-- Every keeper decision row, compact (the keeper logs one per position when something changes).
+CREATE TABLE IF NOT EXISTS decision_min (
+  token_id INTEGER NOT NULL, ts INTEGER NOT NULL, decision TEXT, reason TEXT, outside_secs INTEGER, hold_secs INTEGER,
+  recut_wait TEXT, recut_candidate INTEGER, half_spacings INTEGER, width_best_hs INTEGER, position_usd REAL,
+  spot_tick INTEGER, twap_tick REAL, fee_pips INTEGER, tick_lower INTEGER, tick_upper INTEGER,
+  PRIMARY KEY (token_id, ts)
+);
+
+-- The keeper's own market row (every minute).
+CREATE TABLE IF NOT EXISTS keeper_market_min (
+  ts INTEGER PRIMARY KEY, tick INTEGER, twap_tick REAL, fee_pips INTEGER, weth_usd REAL, aero_usd REAL, gas_usd REAL,
+  rate_per_l REAL, avg_rate_per_l REAL, vol REAL, vol_short REAL, vol_long REAL, staked_liquidity TEXT,
+  reward_rate REAL, tracked_positions INTEGER
+);
+
+-- Every log the Panda pool and its gauge emit, byte for byte (one gzipped JSON array per block range).
+CREATE TABLE IF NOT EXISTS chain_log_archive (
+  from_block INTEGER PRIMARY KEY, to_block INTEGER NOT NULL, logs INTEGER NOT NULL, gz BLOB NOT NULL
+);
+
+-- Every swap in the Panda pool, decoded (amounts as signed decimal strings; token0 WETH, token1 USDC).
+CREATE TABLE IF NOT EXISTS swaps (
+  block INTEGER NOT NULL, log_index INTEGER NOT NULL, ts INTEGER, tx TEXT NOT NULL, sender TEXT, recipient TEXT,
+  amount0 TEXT NOT NULL, amount1 TEXT NOT NULL, sqrt_price TEXT, liquidity TEXT, tick INTEGER, usd REAL,
+  PRIMARY KEY (block, log_index)
+);
+CREATE INDEX IF NOT EXISTS swaps_ts ON swaps (ts);
+
+-- Liquidity changes by the other LPs (pool Mint/Burn/Collect/CollectFees/Flash), per minute and kind.
+-- ~80,000 a day, so the individual events live in chain_log_archive and these are their sums.
+-- in_range_* counts/sums only ranges that contain the price at that event (the ones competing right now).
+CREATE TABLE IF NOT EXISTS lp_minute (
+  ts INTEGER NOT NULL, kind TEXT NOT NULL, events INTEGER NOT NULL, liquidity REAL NOT NULL, amount0 REAL NOT NULL,
+  amount1 REAL NOT NULL, in_range_events INTEGER NOT NULL, in_range_liquidity REAL NOT NULL, width_ticks_mean REAL,
+  PRIMARY KEY (ts, kind)
+);
+
+-- Gauge activity (NFTs staked/unstaked, rewards claimed, emissions notified, early-withdraw penalties), per minute and kind.
+CREATE TABLE IF NOT EXISTS gauge_minute (
+  ts INTEGER NOT NULL, kind TEXT NOT NULL, events INTEGER NOT NULL, liquidity REAL NOT NULL, amount REAL NOT NULL,
+  token_ids INTEGER NOT NULL,
+  PRIMARY KEY (ts, kind)
+);
+
+-- The liquidity map around the price (every 10 min): per initialized tick, total and STAKED liquidity.
+CREATE TABLE IF NOT EXISTS tick_liquidity (
+  ts INTEGER NOT NULL, tick INTEGER NOT NULL, liquidity_gross TEXT, liquidity_net TEXT, staked_liquidity_net TEXT,
+  PRIMARY KEY (ts, tick)
+);
+
+-- Any scalar time series (funding, open interest, order-book depth, emission schedule, vote weights,
+-- fear & greed, keeper wallet balance, ...). source/key name it, e.g. ('deribit', 'ETH-PERPETUAL.funding_8h').
+CREATE TABLE IF NOT EXISTS series (source TEXT NOT NULL, key TEXT NOT NULL, ts INTEGER NOT NULL, value REAL NOT NULL,
+  PRIMARY KEY (source, key, ts));
+
+-- Deribit's whole ETH (and BTC) option board, hourly.
+CREATE TABLE IF NOT EXISTS options_hourly (
+  ts INTEGER NOT NULL, instrument TEXT NOT NULL, underlying REAL, mark_iv REAL, mark_price REAL, open_interest REAL,
+  volume REAL, bid REAL, ask REAL,
+  PRIMARY KEY (ts, instrument)
+);
+
+-- DefiLlama's yield data for every Aerodrome pool on Base (competition), every 6 hours.
+CREATE TABLE IF NOT EXISTS pool_yields (
+  ts INTEGER NOT NULL, pool TEXT NOT NULL, project TEXT, symbol TEXT, meta TEXT, tvl_usd REAL, apy REAL, apy_base REAL,
+  apy_reward REAL, volume_1d REAL, volume_7d REAL, apy_mean_30d REAL,
+  PRIMARY KEY (ts, pool)
+);
+
+-- Crypto headlines (RSS), stored as published. Tagging them comes later.
+CREATE TABLE IF NOT EXISTS news (
+  id TEXT PRIMARY KEY, source TEXT NOT NULL, ts INTEGER NOT NULL, title TEXT NOT NULL, link TEXT, summary TEXT, seen_ts INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS news_ts ON news (ts);
 "#;
 
 /// Columns added after a database may already exist on disk (CREATE TABLE IF NOT EXISTS does not
@@ -81,6 +179,16 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("shadow", "best_net", "REAL"),
     ("shadow", "replay", "TEXT"),
     ("shadow_model", "replay", "TEXT"),
+    // Full capture: traded volume on every Coinbase minute.
+    ("price_1m", "volume", "REAL"),
+    // Full capture: more of the pool and the AERO price in the 30 s read.
+    ("pool_obs", "staked_liquidity", "TEXT"),
+    ("pool_obs", "aero_weth_tick", "INTEGER"),
+    ("pool_obs", "aero_usd", "REAL"),
+    ("pool_obs", "reward_reserve", "REAL"),
+    ("pool_obs", "period_finish", "INTEGER"),
+    ("pool_obs", "gauge_fees0", "TEXT"),
+    ("pool_obs", "gauge_fees1", "TEXT"),
 ];
 
 pub fn migrate(db: &Connection) -> Result<()> {
@@ -100,6 +208,8 @@ impl Store {
             std::fs::create_dir_all(dir)?;
         }
         let db = Connection::open(path)?;
+        // A manual command (backfill, brief) may run while the service writes: wait, don't fail.
+        db.busy_timeout(std::time::Duration::from_secs(60))?;
         db.execute_batch(SCHEMA)?;
         migrate(&db)?;
         Ok(Store { db })
@@ -109,6 +219,7 @@ impl Store {
     pub fn memory() -> Result<Self> {
         let db = Connection::open_in_memory()?;
         db.execute_batch(SCHEMA)?;
+        migrate(&db)?;
         Ok(Store { db })
     }
 
@@ -145,6 +256,8 @@ impl Store {
              UNION ALL
              SELECT ts / 60 * 60, CAST(json_extract(json, '$.tick') AS REAL), 1 FROM keeper_rows
                WHERE tbl = 'market_ticks' AND ts >= ?1 AND ts < ?2
+             UNION ALL
+             SELECT ts / 60 * 60, CAST(tick AS REAL), 2 FROM keeper_market_min WHERE tick IS NOT NULL AND ts >= ?1 AND ts < ?2
              ORDER BY 1, 3",
         )?;
         let rows = st.query_map(params![from, to], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)))?;
@@ -168,7 +281,9 @@ impl Store {
              SELECT ts / 60 * 60, CAST(json_extract(json, '$.tick') AS REAL), CAST(json_extract(json, '$.fee_pips') AS REAL), 1
                FROM keeper_rows WHERE tbl = 'market_ticks' AND ts >= ?1 AND ts < ?2
              UNION ALL
-             SELECT ts / 60 * 60, tick, NULL, 2 FROM price_1m WHERE source = 'pool' AND tick IS NOT NULL AND ts >= ?1 AND ts < ?2
+             SELECT ts / 60 * 60, CAST(tick AS REAL), CAST(fee_pips AS REAL), 2 FROM keeper_market_min WHERE tick IS NOT NULL AND ts >= ?1 AND ts < ?2
+             UNION ALL
+             SELECT ts / 60 * 60, tick, NULL, 3 FROM price_1m WHERE source = 'pool' AND tick IS NOT NULL AND ts >= ?1 AND ts < ?2
              ORDER BY 1, 4",
         )?;
         let rows = st.query_map(params![from, to], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?, r.get::<_, Option<f64>>(2)?)))?;
@@ -189,6 +304,31 @@ impl Store {
 
     pub fn count(&self, sql: &str, args: &[&dyn rusqlite::ToSql]) -> Result<i64> {
         Ok(self.db.query_row(sql, args, |r| r.get(0))?)
+    }
+
+    /// One point of a named scalar series (see the `series` table).
+    pub fn put_series(&self, source: &str, key: &str, ts: i64, value: f64) -> Result<()> {
+        if !value.is_finite() {
+            return Ok(());
+        }
+        self.db.execute(
+            "INSERT INTO series (source, key, ts, value) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(source, key, ts) DO UPDATE SET value = excluded.value",
+            params![source, key, ts, value],
+        )?;
+        Ok(())
+    }
+
+    /// The newest value of a series at or before `ts`.
+    pub fn series_at(&self, source: &str, key: &str, ts: i64) -> Result<Option<(i64, f64)>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT ts, value FROM series WHERE source = ?1 AND key = ?2 AND ts <= ?3 ORDER BY ts DESC LIMIT 1",
+                params![source, key, ts],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
     }
 }
 

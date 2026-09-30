@@ -50,9 +50,9 @@ else
       systemctl stop aikeeper 2>/dev/null || true
       if bash ./deploy/install.sh; then
         systemctl enable aikeeper || log "ENABLE FAILED"
-        # Fill any history the new version reads (cheap when already held: stored minutes and
-        # files are skipped).
-        sudo -u aikeeper /usr/local/bin/aikeeper-env backfill --days 365 || log "update backfill had errors"
+        # The history the new version reads is filled at the end of this script, with the service
+        # already running again (it can take an hour or two; the A.I must not be blind meanwhile).
+        UPDATED=1
         log "update complete: $(git rev-parse --short HEAD)"
       else
         log "INSTALL FAILED; keeping the running version"
@@ -64,6 +64,7 @@ else
     log "code is current: $(git rev-parse --short HEAD)"
   fi
 fi
+UPDATED=${UPDATED:-0}
 
 # Every boot: email settings from metadata (empty values leave the file's value alone).
 ENV=/etc/aikeeper.env
@@ -96,4 +97,11 @@ if [ -n "$TOKEN" ] && [ ! -f "/var/lib/aikeeper-test-brief-$TOKEN" ]; then
   else
     log "TEST BRIEF FAILED ($TOKEN)"
   fi
+fi
+
+# After an update: fill any history the new version reads, while the service runs (both write the
+# same database safely: whatever is already held is skipped, and every range is written once).
+if [ "$UPDATED" = 1 ]; then
+  log "update backfill started (service running)"
+  sudo -u aikeeper /usr/local/bin/aikeeper-env backfill --days 365 && log "update backfill complete" || log "update backfill had errors (run it again to continue)"
 fi
