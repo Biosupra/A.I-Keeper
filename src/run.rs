@@ -47,6 +47,8 @@ pub async fn daemon(cfg: Config) -> Result<()> {
     let mut predict_t = Every::new(cfg.predict_every_secs);
     let mut resolve_t = Every::new(600);
     let mut refit_t = Every::new(86_400);
+    let mut alerts_t = Every::new(600);
+    let mut inbox_t = Every::new(600);
 
     loop {
         let t = now();
@@ -73,7 +75,13 @@ pub async fn daemon(cfg: Config) -> Result<()> {
                     t,
                 );
                 match bucket::sync_days(&b, &store, &days, bucket::Mode::Lean).await {
-                    Ok((o, r)) => tracing::info!("bucket: {o} files, {r} rows"),
+                    Ok((o, r)) => {
+                        tracing::info!("bucket: {o} files, {r} rows");
+                        // A sync counts as healthy when listing worked (sync_days logs per-table errors).
+                        if bucket::readable(&b).await {
+                            store.meta_set("bucket_ok_ts", &t.to_string())?;
+                        }
+                    }
                     Err(e) => tracing::warn!("bucket: {e:#}"),
                 }
             }
@@ -106,6 +114,22 @@ pub async fn daemon(cfg: Config) -> Result<()> {
                 Ok(n) if n > 0 => tracing::info!("graded {n}"),
                 Ok(_) => {}
                 Err(e) => tracing::warn!("resolve: {e:#}"),
+            }
+        }
+        if alerts_t.due(t) {
+            match crate::alerts::run(&cfg, &store, &web, &rpc, t).await {
+                Ok(n) if n > 0 => tracing::warn!("alerts: {n} active"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("alerts: {e:#}"),
+            }
+        }
+        if inbox_t.due(t) {
+            if let Some(email) = &cfg.email {
+                match crate::inbox::fetch(email, 3).await.and_then(|r| crate::inbox::store_replies(&store, &r)) {
+                    Ok(n) if n > 0 => tracing::info!("inbox: {n} new notes from your replies"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("inbox: {e:#}"),
+                }
             }
         }
         // The brief: once a day at the configured UTC hour.

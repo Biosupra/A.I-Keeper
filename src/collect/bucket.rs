@@ -8,7 +8,11 @@
 //! a month. The keeper writes a file per table per MINUTE, so reading everything would cost ~260,000
 //! reads a month. `lean` mode (the default) therefore reads:
 //!   * position_events and keeper_runs in full (sparse: files exist only when something happened),
-//!   * width_evals and keeper_decisions: one file per hour (the newest in each hour folder),
+//!   * width_evals: one file per 10 minutes (the newest in each 10-minute slot). The shadow replay
+//!     needs the table the keeper acted on: with hourly tables a rebalance's new width came out
+//!     wrong on real data (2026-09-30: +/-6% vs the keeper's +/-4.5%); with the minute tables it is
+//!     exact, and the keeper's table moves little inside 10 minutes. ~4,300 reads a month;
+//!   * keeper_decisions: one file per hour (the newest in each hour folder),
 //!   * market_ticks: nothing live (the A.I reads the pool itself every 30 s), except in `History`
 //!     mode (the one-time `backfill`), which reads every market_ticks file once to recover the
 //!     keeper's minute-by-minute price path since its first day (~1,440 files a day, ~22,000 for
@@ -98,6 +102,11 @@ impl<'a> Bucket<'a> {
     }
 }
 
+/// True when the bucket can be listed right now (used to record a healthy sync).
+pub async fn readable(bucket: &Bucket<'_>) -> bool {
+    bucket.list("v1/keeper_runs/").await.is_ok()
+}
+
 /// Decodes a gzipped JSONL file into rows.
 pub fn parse_jsonl_gz(bytes: &[u8]) -> Result<Vec<Value>> {
     let mut s = String::new();
@@ -130,16 +139,20 @@ pub fn select(table: &str, names: &[String], mode: Mode) -> Vec<String> {
     if table == "market_ticks" || table == "position_snapshots" {
         return vec![];
     }
-    // One per hour: the newest file in each hour folder.
-    let mut by_hour: BTreeMap<String, String> = BTreeMap::new();
+    // width_evals: the newest file in each 10-minute slot; everything else: the newest per hour.
+    // File names are `.../hour=HH/keeper-<unix seconds>-<seq>.jsonl.gz`.
+    let slot_secs = if table == "width_evals" { 600 } else { 3600 };
+    let mut by_slot: BTreeMap<String, (i64, String)> = BTreeMap::new();
     for n in names {
-        let hour = n.rsplit_once('/').map(|(h, _)| h.to_string()).unwrap_or_default();
-        let e = by_hour.entry(hour).or_default();
-        if n > e {
-            *e = n.clone();
+        let (folder, file) = n.rsplit_once('/').unwrap_or(("", n.as_str()));
+        let unix: i64 = file.strip_prefix("keeper-").and_then(|r| r.split('-').next()).and_then(|u| u.parse().ok()).unwrap_or(0);
+        let key = format!("{folder}/{}", unix / slot_secs);
+        let e = by_slot.entry(key).or_insert((i64::MIN, String::new()));
+        if unix > e.0 || (unix == e.0 && *n > e.1) {
+            *e = (unix, n.clone());
         }
     }
-    by_hour.into_values().collect()
+    by_slot.into_values().map(|(_, n)| n).collect()
 }
 
 /// Syncs the given days (YYYY-MM-DD) of every table. Returns (objects read, rows stored).
@@ -205,7 +218,12 @@ mod tests {
         .map(|s| s.to_string())
         .collect();
         let s = select("width_evals", &names, Mode::Lean);
-        assert_eq!(s, vec![names[1].clone(), names[2].clone()]);
+        assert_eq!(s, vec![names[1].clone(), names[2].clone()], "100 and 160 share a 10-minute slot; 3700 is another");
+        let decisions: Vec<String> = names.iter().map(|n| n.replace("width_evals", "keeper_decisions")).collect();
+        assert_eq!(select("keeper_decisions", &decisions, Mode::Lean).len(), 2, "one per hour folder");
+        let ten: Vec<String> =
+            (0..6).map(|i| format!("v1/width_evals/dt=2026-09-29/hour=10/keeper-{}-{i}.jsonl.gz", 36_000 + i * 600)).collect();
+        assert_eq!(select("width_evals", &ten, Mode::Lean).len(), 6, "one per 10 minutes");
         assert!(select("market_ticks", &names, Mode::Lean).is_empty());
         assert_eq!(select("position_events", &names, Mode::Lean).len(), 3);
         assert_eq!(select("market_ticks", &names, Mode::History).len(), 3);

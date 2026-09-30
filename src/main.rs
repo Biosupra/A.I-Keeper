@@ -5,11 +5,13 @@
 //! grades itself on what really happened; and emails a daily brief. It holds no key, calls no
 //! write method and cannot change anything anywhere (see `guard.rs` and `docs/GUARDRAILS.md`).
 
+mod alerts;
 mod brief;
 mod chainmath;
 mod collect;
 mod config;
 mod guard;
+mod inbox;
 mod model;
 mod net;
 mod registry;
@@ -57,6 +59,12 @@ enum Cmd {
     },
     /// Tell the A.I something (kept with the day's decisions and shown in the brief).
     Note { text: Vec<String> },
+    /// Check the A.I's copy of the keeper's rules against the keeper's own history.
+    Verify,
+    /// Run every alert check once and print what is wrong (sends nothing).
+    Check,
+    /// Read replies to the brief from the inbox (read-only) and keep them as notes.
+    Inbox,
 }
 
 #[tokio::main]
@@ -116,6 +124,45 @@ async fn main() -> Result<()> {
                 let (subject, body) = brief::build(&s, t)?;
                 println!("{subject}\n\n{body}");
             }
+            Ok(())
+        }
+        Cmd::Verify => {
+            let s = store::Store::open(&cfg.db_path())?;
+            let f = registry::fidelity(&s)?;
+            println!("width choices reproduced:   {} of {}", f.choices.0, f.choices.1);
+            println!("out-of-range clocks within 10 min: {} of {}", f.clocks.0, f.clocks.1);
+            println!("real rebalances reproduced within 10 min: {} of {}", f.rebalances.0, f.rebalances.1);
+            println!("their new widths reproduced (at the real position size): {} of {}", f.widths.0, f.widths.1);
+            for n in f.notes {
+                println!("  {n}");
+            }
+            Ok(())
+        }
+        Cmd::Check => {
+            let s = store::Store::open(&cfg.db_path())?;
+            let web = net::Web::new()?;
+            let rpc = net::Rpc::new(cfg.rpc_urls.clone())?;
+            let findings = alerts::evaluate(&cfg, &s, &web, &rpc, t).await?;
+            if findings.is_empty() {
+                println!("all checks pass");
+            }
+            for f in findings {
+                println!("ALERT {}: {}", f.key, f.message);
+            }
+            Ok(())
+        }
+        Cmd::Inbox => {
+            let Some(email) = &cfg.email else {
+                println!("email is not configured");
+                return Ok(());
+            };
+            let s = store::Store::open(&cfg.db_path())?;
+            let replies = inbox::fetch(email, 7).await?;
+            println!("{} replies from {} in the last 7 days", replies.len(), email.to);
+            for r in &replies {
+                println!("  {} | {} | {}", r.ts, r.subject, r.text.chars().take(80).collect::<String>());
+            }
+            println!("new notes stored: {}", inbox::store_replies(&s, &replies)?);
             Ok(())
         }
         Cmd::Note { text } => {

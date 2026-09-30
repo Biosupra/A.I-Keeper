@@ -1,34 +1,26 @@
 # Roadmap
 
-Owner's decisions (2026-09-28): shadow mode from day one, data 24/7, $0 budget, Rust, Google Cloud
-next to the bucket, daily brief by email, news tagging later. Hands tied until the owner says
-otherwise (see GUARDRAILS.md).
+Owner's decisions (2026-09-28): shadow mode from day one, data 24/7, $0 budget (in practice about
+$0.003/month of bucket reads), Rust, Google Cloud next to the bucket, daily brief by email, news
+tagging later. Hands tied until the owner says otherwise (see GUARDRAILS.md).
 
-## v0.1 — now
-- [x] Guardrails in code and CI (no keys, read-only RPC allowlist, host allowlist, GET-only web)
-- [x] Collectors: pool on Base (30 s), Coinbase minutes, Deribit DVOL, keeper bucket (lean), website
-- [x] Six volatility models incl. HAR (nightly refit) and a self-weighting blend
-- [x] Range-exit probabilities per width (formula on two bases + empirical)
-- [x] Prediction registry with automatic grading and a scorecard
-- [x] Shadow mode on every keeper width table, graded by replay on real ticks
-- [x] Daily brief (email or file), owner notes
-- [x] Deploy kit for the free e2-micro VM
+## Built and running (2026-09-30)
+- Guardrails in code and CI: no keys, read-only RPC allowlist, host allowlist, GET-only web,
+  read-only mail
+- Collectors: pool on Base every 30 s (price, liquidity, fee, gas, AERO emission rate), Coinbase
+  minutes, Deribit DVOL, the keeper's history bucket, the website
+- Six volatility models incl. HAR (nightly refit) and a self-weighting blend; range-exit odds on two
+  price bases
+- Prediction registry with automatic grading and a scorecard
+- Shadow mode: keeper vs every model under the keeper's exact rules, graded on real prices, with a
+  fidelity check against the keeper's own history
+- Alerts by email; replies to the brief read back as notes; daily brief
+- Self-updating server: push to GitHub, restart the VM
 
-## v0.2 — next
-- [ ] Read owner replies to the brief (Gmail IMAP, same app password) into `notes`
-- [ ] Replay the keeper's exact rules (TWAP trigger, 6 h confirmation on TWAP, crash valve, re-cut
-      hysteresis) so shadow grades match the keeper's real accounting
-- [ ] Emission forecasts: next-epoch AERO rate from `rewardRate`, staked liquidity and weekly votes
-- [ ] Compare shadow grades with the keeper's REAL outcomes (position_events + snapshots)
-- [ ] Weekly deep-review email (7-day scorecard, biggest misses, what changed)
-- [ ] Alerts: pool/keeper anomalies (width feed stale > 30 min, no keeper rows for 2 h, site down)
-
-## v0.3 — learning more
-- [ ] Features beyond volatility: DVOL term structure, funding rates, time of day/week, gas regime
-- [ ] A gradient-boosted exit-probability model trained walk-forward on the registry's own history
-- [ ] Width recommendations with evidence ("over 30 days, ±X% in regime Y beat the keeper by Z")
-
-## Later (owner's call)
-- [ ] News / macro calendar tagging
-- [ ] Recommend mode: proposals people review and apply through the normal keeper release process
-- [ ] A small capped trial, with limits enforced on-chain by the upgradeable platform's bounded keeper
+## Deliberately not built yet
+Only what the owner has deferred or must decide:
+- **News / macro tagging** — owner deferred it (2026-09-28).
+- **Recommend mode** (the A.I proposing keeper setting changes for people to review) — owner's call
+  once the scorecard has ~30 independent days behind it.
+- **Any live trading, even a capped trial** — owner's call, and only with limits enforced on-chain by
+  the upgradeable platform's bounded keeper.

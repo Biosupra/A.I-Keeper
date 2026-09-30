@@ -16,7 +16,7 @@ account that can only **read** the keeper's bucket. About 20 minutes, mostly cop
 | Item | Cost |
 |---|---|
 | e2-micro VM + 30 GB standard disk, us-central1 | always-free tier (1 per billing account) |
-| Reading `gs://pfkeeperdata` | the bucket is **US multi-region**, which the free Storage allowance does not cover (it covers us-east1/us-west1/us-central1 only). At $0.0004 per 1,000 reads: about **$0.001 a month** live and **~$0.01 once** for the history backfill. Transfer US → us-central1 is free. |
+| Reading `gs://pfkeeperdata` | the bucket is **US multi-region**, which the free Storage allowance does not cover (it covers us-east1/us-west1/us-central1 only). At $0.0004 per 1,000 reads: about **$0.003 a month** live (width tables every 10 minutes, see `src/collect/bucket.rs`) and **~$0.01 once** for the history backfill. Transfer US → us-central1 is free. |
 | VM external IPv4 address | **Not confirmed.** Google's free-tier page does not say either way; if charged it is about $0.005/hour. The $1 budget alert below will tell you within days. |
 | Coinbase, Deribit, Base public RPC, Gmail | free |
 

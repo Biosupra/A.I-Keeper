@@ -41,10 +41,21 @@ On Google Cloud the VM runs as a dedicated service account with exactly one perm
 it cannot write, delete, or see anything else in the project. The live keeper's own key (which can
 create objects) is never given to it. See `docs/DEPLOY.md`.
 
-## 5. What it can change
+## 5. Mail: send to the owner, read the owner's replies — nothing else
 
-Only its own SQLite file and its own brief files on its own disk. Its only outward action is one
-email a day to the owner.
+* It sends the daily brief and alerts through Gmail SMTP to the owner's address only.
+* It reads replies with IMAP **EXAMINE** (the read-only open) and **BODY.PEEK** (nothing is marked
+  read, moved, flagged or deleted), and keeps only messages from the owner's address that Gmail
+  itself authenticates (DMARC/DKIM pass), so a spoofed sender is ignored. Reply text is stored as a
+  note; nothing in it is ever executed or acted on.
+* CI fails if `src/inbox.rs` ever calls SELECT, STORE, EXPUNGE, APPEND, COPY, MOVE, DELETE, CREATE
+  or RENAME, stops using EXAMINE/BODY.PEEK, or skips the host allowlist; and if any other file
+  opens a raw socket.
+
+## 6. What it can change
+
+Only its own SQLite file and its own brief files on its own disk. Its only outward actions are
+emails to the owner: the daily brief and alerts (at most 12 alert emails a day).
 
 ## Moving past watch-only
 

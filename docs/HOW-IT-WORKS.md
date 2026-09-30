@@ -45,28 +45,64 @@ Grading: volatility with QLIKE (0 perfect; punishes under-forecasting risk harde
 Brier score (0 perfect, 0.25 = coin flip). Ungradable forecasts (data never arrived) are closed after
 two days.
 
-## Shadow mode (`src/model/shadow.rs`)
+## Shadow mode (`src/model/shadow.rs`, `src/registry.rs`)
 
-For each hour's newest keeper width table:
+For each hour's keeper width table the A.I records a decision. 24 hours later (once the prices and
+the keeper's tables for that day have arrived) it replays, on the pool's real one-minute ticks:
 
-1. **A.I volatility** = keeper's volatility × (champion model ÷ keeper-style estimator), both
-   computed on Coinbase *as of the table's time*.
-2. **Rescore.** A random walk that must travel `a` at volatility `s` behaves like one travelling
-   `a·s0/s` at `s0`. So under the A.I's volatility, width `h` behaves like the keeper's row at
-   `h_eff = h · s_keeper / s_ai`: that row's time in range, rebalances per day and (× `s_ai/s_keeper`)
-   divergence apply, while the reward per day in range is the real width's. Cost per rebalance is
-   what the row implies (reward − score before divergence, per rebalance). With `s_ai = s_keeper`
-   this reproduces the keeper's scores exactly (unit-tested).
-3. **Choose** the best-scoring width. (The keeper's own `choice` adds hysteresis around its ±2% home
-   width; the A.I's is a plain argmax. Both are recorded.)
-4. **Grade** after 24 h: a $1,000 position at every width is replayed on the pool's real one-minute
-   ticks — reward while in range (table rate × the row's emission capture, 80% share), rebalance after 6 h outside with a 2 h
-   cooldown paying the row's cost, exact concentrated-liquidity divergence against holding each
-   range's starting mix. Market direction is excluded, as in the keeper's score. The keeper's pick,
-   the A.I's pick and the best-in-hindsight width are stored.
+* **the keeper's strategy** — its own tables and choices;
+* **each model's strategy** — the same tables re-scored at that model's volatility view
+  (volatility ratio model/keeper-style, applied to the keeper's own number; see the basis note);
+* **every fixed width** — the ceiling a perfect width-picker could have reached.
 
-The replay is a simplification of the keeper (no TWAP trigger, no crash valve, no re-cuts); both
-picks are graded by the same rules, so the comparison is fair even where the absolute numbers differ.
+The replay is a port of the live keeper 0.8.0 (`decide`, `choose_width`, `best_for_position`,
+`should_hold_out`, `assess_recut`, `confirm_recut`, `recut_gate`, `divergence_fraction`), with the
+settings read from the keeper's own `keeper_runs` log so a policy change is followed automatically:
+
+* trigger on the 5-minute TWAP; 6 h outside without re-entering to confirm; 2 h cooldown; at most
+  3 rebalances in 24 h;
+* hold while the pool fee is above 1000 pips or spot is more than 50 ticks from the TWAP, up to 2 h;
+* crash valve: when no width pays and even the widest range would exit ≥ 0.65 times a day, sit out,
+  capped at 24 h or 400 ticks past the edge;
+* in-range re-cuts: width ratio ≥ 2, gain ≥ 4 × the one-off cost over 24 h, same direction for 3 h,
+  narrowing only 12 h after a known rebalance/deposit and never below ±3%, widening a fresh
+  deposit only 12 h after it (once the deposit time is known, as in the keeper);
+* new ranges: the table's hysteresis choice (±2% home width unless a narrower one is 10% better or a
+  wider one 25% better), snapped to the 50-tick grid;
+* money: reward while spot is in range at the table's rate × emission capture × the 80% share;
+  each rebalance pays half a swap at the pool's actual fee plus the table's gas; divergence against
+  each range's mint-time mix is realised at every close and marked to market at the end.
+
+Tables are read every 10 minutes (the replay uses the one in force at each moment). With only hourly
+tables a real rebalance's new width came out wrong (±6% vs the keeper's ±4.5%); with the minute
+tables it is exact. The replay's position is the keeper's reference $1,000; `verify` also re-scores
+at each real position's size (gas weighs more on small positions).
+
+**Fidelity check (`aikeeper verify`, and in every brief):** width choices reproduced, out-of-range
+clocks within 10 minutes of the keeper's own log, real rebalance times within 10 minutes, and their
+new widths at the real position size. 2026-09-30: 185/185, 14/14, 1/1 (11 s), 1/1. If the keeper's
+rules change, the rule-drift alert fires.
+
+## Alerts (`src/alerts.rs`)
+
+Every 10 minutes; email on start, a reminder every 6 h while it lasts, "resolved" when it clears,
+at most 12 alert emails a day:
+
+| Alert | Fires when |
+|---|---|
+| keeper-heartbeat | the keeper's signed deposit-width feed is > 30 min old (it posts every 5) |
+| keeper-gas | the keeper wallet holds < 0.001 ETH on Base |
+| site | `/` or `/api/health` fails twice in a row |
+| keeper-history | the keeper's newest history row is > 3 h older than the A.I's last good bucket read |
+| keeper-runaway / keeper-stuck | a runaway-guard skip, or a position out of range > 26 h (valve cap is 24 h) |
+| rule-drift | the keeper chose widths the A.I's copy of its rules would not |
+| ai-chain / ai-market / ai-bucket | the A.I's own Base reads, Coinbase prices or bucket access stalled |
+
+## Replies (`src/inbox.rs`)
+
+Every 10 minutes the inbox of the sending account is opened read-only; messages from the owner's
+address that Gmail authenticates are kept as notes (quoted brief text stripped) and shown in the next
+brief. `aikeeper note "..."` does the same from the command line.
 
 ## Brief
 

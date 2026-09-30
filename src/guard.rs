@@ -49,6 +49,9 @@ pub const ALLOWED_HOSTS: &[&str] = &[
     "metadata.google.internal",
     // Panda's own website, GET only (the Worker's POST routes write to production).
     "pandafinancial.org",
+    // The owner's mail: sending the brief (SMTP) and reading replies to it (IMAP, read-only EXAMINE).
+    "smtp.gmail.com",
+    "imap.gmail.com",
 ];
 
 /// Hosts that are refused even if someone adds them above by mistake, with the reason.

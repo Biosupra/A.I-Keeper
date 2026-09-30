@@ -147,10 +147,14 @@ pub fn make_shadow(store: &Store, now: i64) -> Result<usize> {
         let (Some(&mine), Some(&keeper_style)) = (f.get(model.as_str()).or_else(|| f.get("keeper")), f.get("keeper")) else { continue };
         let ratio = mine / keeper_style;
         let ai_vol = table.vol * ratio;
-        let (ai_choice, scores) = table.rescore(ai_vol);
+        // Every strategy picks its width with the keeper's own hysteresis rule, under the policy the
+        // keeper was running at that moment.
+        let policy = policy_at(store, ts)?;
+        let scores = table.rescore(ai_vol);
+        let ai_choice = shadow::choose(&table, &scores, &policy);
         for (m, v) in &f {
             let mv = table.vol * v / keeper_style;
-            let (c, _) = table.rescore(mv);
+            let c = shadow::choose(&table, &table.rescore(mv), &policy);
             store.db.execute(
                 "INSERT OR IGNORE INTO shadow_model (made_ts, model, vol, choice) VALUES (?1, ?2, ?3, ?4)",
                 params![ts, m, mv, c],
@@ -218,40 +222,295 @@ pub fn resolve(store: &Store, now: i64) -> Result<usize> {
             None => {}
         }
     }
-    // Shadow rows.
-    let open: Vec<(i64, String)> = {
-        let mut st = store.db.prepare("SELECT made_ts, detail FROM shadow WHERE resolved_ts IS NULL AND made_ts + 86400 <= ?1")?;
-        let rows = st.query_map([now], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    // Shadow rows: each is graded once the 24 h after it are fully covered by prices AND by the
+    // keeper's hourly tables (the bucket is read every 6 h, so tables can arrive later than prices).
+    let open: Vec<i64> = {
+        let mut st = store.db.prepare("SELECT made_ts FROM shadow WHERE resolved_ts IS NULL AND made_ts + 86400 <= ?1 ORDER BY made_ts")?;
+        let rows = st.query_map([now], |r| r.get(0))?;
         rows.collect::<std::result::Result<_, _>>()?
     };
-    for (made, detail) in open {
-        let d: Value = serde_json::from_str(&detail).unwrap_or_default();
-        let Ok(table) = serde_json::from_value::<shadow::Table>(d["table"].clone()) else { continue };
-        let path = store.pool_ticks(made, made + 86_400)?;
-        let (ai_choice, keeper_choice): (i64, i64) =
-            store.db.query_row("SELECT ai_choice, keeper_choice FROM shadow WHERE made_ts = ?1", [made], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        let all: Vec<(i64, f64)> =
-            table.rows.iter().filter_map(|r| shadow::replay(&table, r.h as i64, &path, made, 86_400).map(|n| (r.h as i64, n))).collect();
-        let get = |h: i64| all.iter().find(|(x, _)| *x == h).map(|(_, n)| *n);
-        match (get(keeper_choice), get(ai_choice)) {
-            (Some(k), Some(a)) => {
-                let best = all.iter().max_by(|x, y| x.1.total_cmp(&y.1)).copied();
-                store.db.execute(
-                    "UPDATE shadow SET keeper_net_per_day = ?1, ai_net_per_day = ?2, best_hindsight = ?3, best_net = ?4, resolved_ts = ?5 WHERE made_ts = ?6",
-                    params![k, a, best.map(|b| b.0), best.map(|b| b.1), now, made],
-                )?;
-                for (h, n) in &all {
-                    store.db.execute("UPDATE shadow_model SET net_per_day = ?1 WHERE made_ts = ?2 AND choice = ?3", params![n, made, h])?;
-                }
+    for made in open {
+        match grade_shadow(store, made)? {
+            Some(()) => {
+                store.db.execute("UPDATE shadow SET resolved_ts = ?1 WHERE made_ts = ?2", params![now, made])?;
                 graded += 1;
             }
-            _ if now > made + 3 * 86_400 => {
+            None if now > made + 3 * 86_400 => {
                 store.db.execute("UPDATE shadow SET resolved_ts = ?1 WHERE made_ts = ?2", params![now, made])?;
             }
-            _ => {}
+            None => {}
         }
     }
     Ok(graded)
+}
+
+/// The keeper's rebalance policy as its most recent start at or before `t` logged it.
+pub fn policy_at(store: &Store, t: i64) -> Result<shadow::Policy> {
+    let raw: Option<String> = store
+        .db
+        .query_row("SELECT json FROM keeper_rows WHERE tbl = 'keeper_runs' AND ts <= ?1 ORDER BY ts DESC LIMIT 1", [t], |r| r.get(0))
+        .ok();
+    Ok(match raw.and_then(|r| serde_json::from_str::<Value>(&r).ok()) {
+        Some(v) => shadow::Policy::from_keeper_run(&v),
+        None => shadow::Policy::default(),
+    })
+}
+
+/// Replays the 24 h after a shadow decision under the keeper's exact rules for the keeper's own
+/// strategy, every model's strategy and every fixed width, and stores the results. None when the
+/// window is not yet covered (prices < 90%, or fewer than 20 hourly tables, or none after hour 23).
+pub fn grade_shadow(store: &Store, made: i64) -> Result<Option<()>> {
+    let end = made + 86_400;
+    // Every keeper table stored for the window (one per 10 minutes live), so each action is taken
+    // with the table the keeper had at that moment.
+    let tables: Vec<shadow::Table> = {
+        let mut st = store.db.prepare("SELECT json FROM keeper_rows WHERE tbl = 'width_evals' AND ts >= ?1 AND ts < ?2 ORDER BY ts")?;
+        let rows = st.query_map([made, end], |r| r.get::<_, String>(0))?;
+        let mut v: Vec<shadow::Table> = rows
+            .filter_map(|r| r.ok())
+            .filter_map(|d| serde_json::from_str::<Value>(&d).ok())
+            .filter_map(|d| shadow::Table::from_keeper(&d))
+            .collect();
+        v.dedup_by_key(|t| t.ts);
+        v
+    };
+    let hours_covered = tables.iter().map(|t| (t.ts - made) / 3600).collect::<std::collections::BTreeSet<_>>().len();
+    if hours_covered < 20 || tables.last().map(|t| t.ts < made + 23 * 3600).unwrap_or(true) || tables[0].ts > made + 600 {
+        return Ok(None);
+    }
+    let path = store.pool_path(made - 600, end)?;
+    let policy = policy_at(store, made)?;
+    let keeper_hours = shadow::hours_for(&tables, None, &policy);
+    let Some(keeper) = shadow::replay(&policy, &keeper_hours, &path, made, 86_400, None) else { return Ok(None) };
+
+    // Each model: its own volatility at each hour (from that hour's shadow_model row; an hour it
+    // has no row for keeps its previous one).
+    let models: Vec<String> = {
+        let mut st = store.db.prepare("SELECT model FROM shadow_model WHERE made_ts = ?1")?;
+        let rows = st.query_map([made], |r| r.get(0))?;
+        rows.collect::<std::result::Result<_, _>>()?
+    };
+    let mut model_results: Vec<(String, shadow::Replay)> = Vec::new();
+    for m in &models {
+        // The model's volatility VIEW is refreshed hourly (its shadow_model rows) and expressed as a
+        // ratio to the keeper's own volatility, so it is applied to every 10-minute table in between.
+        let ratios: Vec<(i64, f64)> = {
+            let mut st = store.db.prepare(
+                "SELECT m.made_ts, m.vol / s.keeper_vol FROM shadow_model m JOIN shadow s ON s.made_ts = m.made_ts
+                 WHERE m.model = ?1 AND m.made_ts >= ?2 AND m.made_ts < ?3 AND s.keeper_vol > 0 ORDER BY m.made_ts",
+            )?;
+            let rows = st.query_map(params![m, made - 3600, end], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        let vols: Vec<f64> = tables
+            .iter()
+            .map(|t| {
+                let i = ratios.partition_point(|r| r.0 <= t.ts);
+                let ratio = if i > 0 { ratios[i - 1].1 } else { 1.0 };
+                t.vol * ratio
+            })
+            .collect();
+        let hours = shadow::hours_for(&tables, Some(&vols), &policy);
+        if let Some(r) = shadow::replay(&policy, &hours, &path, made, 86_400, None) {
+            store.db.execute(
+                "UPDATE shadow_model SET net_per_day = ?1, replay = ?2 WHERE made_ts = ?3 AND model = ?4",
+                params![r.net_per_day, serde_json::to_string(&r)?, made, m],
+            )?;
+            model_results.push((m.clone(), r));
+        }
+    }
+    // Fixed widths: the ceiling a perfect width-picker could have reached.
+    let fixed: Vec<(i64, f64)> = tables[0]
+        .rows
+        .iter()
+        .filter_map(|r| shadow::replay(&policy, &keeper_hours, &path, made, 86_400, Some(r.h as i64)).map(|x| (r.h as i64, x.net_per_day)))
+        .collect();
+    let best = fixed.iter().copied().max_by(|a, b| a.1.total_cmp(&b.1));
+    let ai_model: String = store.db.query_row("SELECT ai_model FROM shadow WHERE made_ts = ?1", [made], |r| r.get(0))?;
+    let ai = model_results.iter().find(|(m, _)| *m == ai_model).map(|(_, r)| r.net_per_day).unwrap_or(keeper.net_per_day);
+    store.db.execute(
+        "UPDATE shadow SET keeper_net_per_day = ?1, ai_net_per_day = ?2, best_hindsight = ?3, best_net = ?4, replay = ?5 WHERE made_ts = ?6",
+        params![
+            keeper.net_per_day,
+            ai,
+            best.map(|b| b.0),
+            best.map(|b| b.1),
+            json!({ "keeper": keeper, "fixed": fixed, "policy": policy }).to_string(),
+            made
+        ],
+    )?;
+    Ok(Some(()))
+}
+
+/// Result of checking the A.I's copy of the keeper's rules against what the live keeper did.
+#[derive(Debug, Default)]
+pub struct Fidelity {
+    /// Width tables whose logged choice the hysteresis rule reproduces.
+    pub choices: (i64, i64),
+    /// Real rebalances whose time the replay reproduces within 10 minutes.
+    pub rebalances: (i64, i64),
+    /// Logged "TWAP outside for X" clocks the A.I measures within 10 minutes.
+    pub clocks: (i64, i64),
+    /// Real rebalances whose new width the rule reproduces for the position's real size.
+    pub widths: (i64, i64),
+    pub notes: Vec<String>,
+}
+
+fn parse_dur(s: &str) -> Option<i64> {
+    // keeper fmt_dur: "5h03m", "42m52s", "40s"
+    let s = s.trim();
+    if let Some((h, rest)) = s.split_once('h') {
+        return Some(h.parse::<i64>().ok()? * 3600 + rest.trim_end_matches('m').parse::<i64>().ok()? * 60);
+    }
+    if let Some((m, rest)) = s.split_once('m') {
+        return Some(m.parse::<i64>().ok()? * 60 + rest.trim_end_matches('s').parse::<i64>().ok()?);
+    }
+    s.trim_end_matches('s').parse().ok()
+}
+
+/// TWAP (mean of minute ticks over the policy window) at `t` from a minute path.
+fn twap_at(path: &[(i64, f64, Option<f64>)], t: i64, secs: i64) -> Option<f64> {
+    let w: Vec<f64> = path.iter().filter(|x| x.0 > t - secs && x.0 <= t).map(|x| x.1).collect();
+    (w.len() >= 2).then(|| w.iter().sum::<f64>() / w.len() as f64)
+}
+
+/// Checks the rules engine against the keeper's own history rows in the A.I's database.
+pub fn fidelity(store: &Store) -> Result<Fidelity> {
+    let mut f = Fidelity::default();
+    // 1. Width choice: every logged width table.
+    let rows: Vec<(i64, String)> = {
+        let mut st = store.db.prepare("SELECT ts, json FROM keeper_rows WHERE tbl = 'width_evals' ORDER BY ts")?;
+        let r = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        r.collect::<std::result::Result<_, _>>()?
+    };
+    let mut tables: Vec<shadow::Table> = Vec::new();
+    for (ts, raw) in &rows {
+        let Some(t) = serde_json::from_str::<Value>(raw).ok().and_then(|v| shadow::Table::from_keeper(&v)) else { continue };
+        let p = policy_at(store, *ts)?;
+        let nets: Vec<(i64, f64)> = t.rows.iter().map(|r| (r.h as i64, r.net)).collect();
+        let c = shadow::choose(&t, &nets, &p);
+        f.choices.1 += 1;
+        if c == t.choice {
+            f.choices.0 += 1;
+        } else if f.notes.len() < 10 {
+            f.notes.push(format!("width table {ts}: keeper chose {} but the rule gives {c}", t.choice));
+        }
+        tables.push(t);
+    }
+    // 2. Out-of-range clocks: every logged "TWAP outside for X".
+    let decisions: Vec<Value> = {
+        let mut st = store.db.prepare("SELECT json FROM keeper_rows WHERE tbl = 'keeper_decisions' AND json LIKE '%TWAP outside for%'")?;
+        let r = st.query_map([], |r| r.get::<_, String>(0))?;
+        r.filter_map(|x| x.ok()).filter_map(|x| serde_json::from_str(&x).ok()).collect()
+    };
+    let mut seen = std::collections::HashSet::new();
+    for d in decisions {
+        let (Some(ts), Some(lo), Some(hi), Some(reason)) =
+            (d["ts"].as_i64(), d["tick_lower"].as_f64(), d["tick_upper"].as_f64(), d["reason"].as_str())
+        else {
+            continue;
+        };
+        if !seen.insert((ts, lo as i64, hi as i64)) {
+            continue; // the same decision logged for several positions with one range
+        }
+        let Some(logged) = reason.strip_prefix("TWAP outside for ").and_then(|r| r.split(" of ").next()).and_then(parse_dur) else {
+            continue;
+        };
+        let p = policy_at(store, ts)?;
+        let path = store.pool_path(ts - logged - 2 * 3600, ts + 60)?;
+        // Walk back from ts while the TWAP stays outside the range.
+        let mut t = ts / 60 * 60;
+        let mut ours = 0;
+        while let Some(tw) = twap_at(&path, t, p.twap_secs) {
+            if tw >= lo && tw < hi {
+                break;
+            }
+            ours = ts - t;
+            t -= 60;
+            if ours > logged + 3 * 3600 {
+                break;
+            }
+        }
+        f.clocks.1 += 1;
+        if (ours - logged).abs() <= 600 {
+            f.clocks.0 += 1;
+        } else if f.notes.len() < 20 {
+            f.notes.push(format!("clock at {ts} range [{lo}, {hi}): keeper said {logged}s outside, A.I measures {ours}s"));
+        }
+    }
+    // 3. Real rebalances: replay from the position's real range and compare the time.
+    let events: Vec<Value> = {
+        let mut st = store.db.prepare("SELECT json FROM keeper_rows WHERE tbl = 'position_events' ORDER BY ts")?;
+        let r = st.query_map([], |r| r.get::<_, String>(0))?;
+        r.filter_map(|x| x.ok()).filter_map(|x| serde_json::from_str::<Value>(&x).ok()).filter(|v| v["kind"] == "rebalance").collect()
+    };
+    let starts: Vec<i64> = {
+        let mut st = store.db.prepare("SELECT ts FROM keeper_rows WHERE tbl = 'keeper_runs' ORDER BY ts")?;
+        let r = st.query_map([], |r| r.get(0))?;
+        r.collect::<std::result::Result<_, _>>()?
+    };
+    let mut done = std::collections::HashSet::new();
+    for e in events {
+        let m = &e["meta"];
+        let (Some(ts), Some(lo), Some(hi)) = (e["ts"].as_i64(), m["old_tick_lower"].as_f64(), m["old_tick_upper"].as_f64()) else {
+            continue;
+        };
+        if !done.insert((ts / 60, lo as i64, hi as i64)) {
+            continue; // several positions with the same range rebalanced in one heartbeat
+        }
+        let p = policy_at(store, ts)?;
+        let path = store.pool_path(ts - 40 * 3600, ts + 3 * 3600)?;
+        // Start where the TWAP was last inside the range (or at the keeper's last restart, which
+        // resets its clocks), so the replay's clock starts where the keeper's did.
+        let mut t_in = ts / 60 * 60;
+        while let Some(tw) = twap_at(&path, t_in, p.twap_secs) {
+            if tw >= lo && tw < hi {
+                break;
+            }
+            t_in -= 60;
+            if ts - t_in > 36 * 3600 {
+                break;
+            }
+        }
+        let restart = starts.iter().copied().filter(|s| *s > t_in && *s < ts).max();
+        let start = restart.unwrap_or(t_in);
+        let hours: Vec<shadow::Hour> = {
+            let near: Vec<shadow::Table> = tables.iter().filter(|t| t.ts <= ts + 3600).cloned().collect();
+            let from = near.iter().rposition(|t| t.ts <= start).unwrap_or(0);
+            shadow::hours_for(&near[from..], None, &p)
+        };
+        if hours.is_empty() {
+            continue;
+        }
+        let init = shadow::Start { lower: lo, upper: hi, mint: (lo + hi) / 2.0, last_rebalance: None, deposit_known: None };
+        let Some(r) = shadow::replay_from(&p, &hours, &path, start, ts - start + 3 * 3600, None, Some(init)) else {
+            f.notes.push(format!("rebalance at {ts}: not enough price data to replay"));
+            continue;
+        };
+        f.rebalances.1 += 1;
+        match r.actions.first() {
+            Some((t, kind, to)) if (t - ts).abs() <= 600 => {
+                f.rebalances.0 += 1;
+                // The width for THIS position's size (the keeper re-scores at its real value).
+                let at = hours.iter().rposition(|h| h.table.ts <= *t).unwrap_or(0);
+                let size = m["position_usd"].as_f64().unwrap_or(0.0);
+                let sized = hours[at].table.nets_for_size(&hours[at].nets, size);
+                let sized_choice = shadow::choose(&hours[at].table, &sized, &p);
+                let opened = m["half_spacings"].as_i64().unwrap_or(-1);
+                f.widths.1 += 1;
+                if sized_choice == opened {
+                    f.widths.0 += 1;
+                }
+                f.notes.push(format!(
+                    "rebalance at {ts}: replay acted at {t} ({:+} s, {kind}); width for a ${size:.2} position {sized_choice} vs keeper {opened} (at $1,000: {to})",
+                    t - ts
+                ));
+            }
+            Some((t, kind, _)) => f.notes.push(format!("rebalance at {ts}: replay {kind} at {t} ({:+} min)", (t - ts) / 60)),
+            None => f.notes.push(format!("rebalance at {ts}: replay took no action")),
+        }
+    }
+    Ok(f)
 }
 
 pub struct ScoreLine {
@@ -360,22 +619,72 @@ mod tests {
         let raw = std::fs::read_to_string("tests/fixtures/width_evals.json").unwrap();
         let v: Value = serde_json::from_str(&raw).unwrap();
         let ts = v["ts"].as_i64().unwrap();
-        let tick = v["current_tick"].as_f64().unwrap();
-        // Price history before the table (for the A.I's volatility) and a flat path after it.
-        for (t, p) in gbm(ts - 3 * 86_400, 3 * 1440, 0.004, 5) {
+        let tick = v["current_tick"].as_i64().unwrap();
+        // Price history before the table (for the A.I's volatility).
+        for (t, p) in gbm(ts - 3 * 86_400, 4 * 1440, 0.004, 5) {
             s.put_price("coinbase", t, p, None, None, None).unwrap();
         }
-        for i in 0..1500 {
-            s.put_price("pool", ts / 60 * 60 + i * 60, 2715.0, None, None, Some(tick)).unwrap();
-        }
-        s.db.execute("INSERT INTO keeper_rows (obj, line, tbl, ts, json) VALUES ('o', 0, 'width_evals', ?1, ?2)", params![ts, raw.trim()])
+        // A flat pool path through the next day, with the pool fee, as the collector writes it.
+        for i in -20..1500 {
+            let t = ts / 60 * 60 + i * 60;
+            s.db.execute(
+                "INSERT INTO pool_obs (ts, block, tick, sqrt_price, liquidity, fee_pips, base_fee_gwei, weth_usd) VALUES (?1, 0, ?2, '0', '0', 400, 0.005, 2715.0)",
+                params![t, tick],
+            )
             .unwrap();
-        assert_eq!(make_shadow(&s, ts + 60).unwrap(), 1);
-        assert_eq!(make_shadow(&s, ts + 120).unwrap(), 0, "not twice");
-        assert_eq!(resolve(&s, ts + 86_400 + 60).unwrap(), 1);
+        }
+        // The keeper's hourly width tables for the whole window (the same table each hour).
+        for hour in 0..25 {
+            let mut row = v.clone();
+            row["ts"] = json!(ts + hour * 3600);
+            s.db.execute(
+                "INSERT INTO keeper_rows (obj, line, tbl, ts, json) VALUES (?1, 0, 'width_evals', ?2, ?3)",
+                params![format!("o{hour}"), ts + hour * 3600, row.to_string()],
+            )
+            .unwrap();
+        }
+        assert_eq!(make_shadow(&s, ts + 25 * 3600).unwrap(), 25);
+        assert_eq!(make_shadow(&s, ts + 25 * 3600).unwrap(), 0, "not twice");
+        // Not gradable before 24 h have passed; gradable after.
+        assert_eq!(resolve(&s, ts + 3600).unwrap(), 0);
+        let graded = resolve(&s, ts + 86_400 + 60).unwrap();
+        assert!(graded >= 1, "the first decision's window is covered");
         let (_, sh) = scorecard(&s, ts + 86_400 + 60, 30).unwrap();
         let sh = sh.unwrap();
-        assert_eq!(sh.n, 1);
-        assert!(sh.keeper_mean > 0.0 && sh.ai_mean > 0.0, "flat price: both earn");
+        assert!(sh.keeper_mean > 0.0 && sh.ai_mean > 0.0, "flat price: every strategy earns");
+        assert!(sh.hindsight_mean >= sh.keeper_mean - 1e-12, "the fixed-width ceiling is at least the keeper's result on a flat day");
+        let models: i64 = s.count("SELECT COUNT(*) FROM shadow_model WHERE net_per_day IS NOT NULL", &[]).unwrap();
+        assert!(models >= 3, "every model graded: {models}");
+        let rep: String = s.db.query_row("SELECT replay FROM shadow WHERE resolved_ts IS NOT NULL LIMIT 1", [], |r| r.get(0)).unwrap();
+        let rep: Value = serde_json::from_str(&rep).unwrap();
+        assert_eq!(rep["keeper"]["rebalances"], 0, "a flat day needs no rebalance");
+        assert_eq!(rep["policy"]["confirmation_secs"], 21600, "keeper default policy when no keeper_runs row");
+    }
+
+    #[test]
+    fn policy_follows_keeper_runs() {
+        let s = Store::memory().unwrap();
+        s.db.execute(
+            "INSERT INTO keeper_rows (obj, line, tbl, ts, json) VALUES ('r', 0, 'keeper_runs', 100, ?1)",
+            [json!({"policy": {"confirmation_secs": 10800}}).to_string()],
+        )
+        .unwrap();
+        assert_eq!(policy_at(&s, 50).unwrap().confirmation_secs, 21_600, "before the start: defaults");
+        assert_eq!(policy_at(&s, 150).unwrap().confirmation_secs, 10_800, "after: the logged policy");
+    }
+
+    #[test]
+    fn migrations_add_missing_columns() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE pool_obs (ts INTEGER PRIMARY KEY); CREATE TABLE shadow (made_ts INTEGER PRIMARY KEY); CREATE TABLE shadow_model (made_ts INTEGER, model TEXT);").unwrap();
+        crate::store::migrate(&db).unwrap();
+        crate::store::migrate(&db).unwrap(); // idempotent
+        let cols = |t: &str| -> Vec<String> {
+            let mut st = db.prepare(&format!("PRAGMA table_info({t})")).unwrap();
+            st.query_map([], |r| r.get::<_, String>(1)).unwrap().map(|c| c.unwrap()).collect()
+        };
+        assert!(cols("pool_obs").contains(&"reward_rate".to_string()));
+        assert!(cols("shadow").contains(&"replay".to_string()) && cols("shadow").contains(&"best_net".to_string()));
+        assert!(cols("shadow_model").contains(&"replay".to_string()));
     }
 }

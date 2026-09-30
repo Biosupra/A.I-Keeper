@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Google Compute Engine startup script for the A.I Keeper VM. Runs as root at EVERY boot:
 #   * first boot: swap, Rust, build from GitHub, install the service, backfill history, start;
+#   * later boots: pull the newest code from GitHub and rebuild when it changed (so an update is
+#     "push, then restart the VM");
 #   * every boot: copy email settings from the VM's metadata into /etc/aikeeper.env and restart,
 #     so the Gmail app password can be added in the Cloud console (VM -> Edit -> Metadata ->
 #     key `aik-smtp-password`) and never has to travel through chat or git.
@@ -34,6 +36,26 @@ if [ ! -f "$DONE" ]; then
   systemctl enable aikeeper
   touch "$DONE"
   log "first boot complete"
+else
+  # Every later boot: update to the newest code on GitHub when it changed. A failed build keeps the
+  # running version (install.sh is only reached after a successful build).
+  export PATH=/root/.cargo/bin:$PATH
+  cd /opt/aikeeper-src
+  if git fetch --depth 1 origin main && [ "$(git rev-parse HEAD)" != "$(git rev-parse FETCH_HEAD)" ]; then
+    log "update: $(git rev-parse --short HEAD) -> $(git rev-parse --short FETCH_HEAD)"
+    git reset --hard FETCH_HEAD
+    if cargo build --release; then
+      systemctl stop aikeeper || true
+      ./deploy/install.sh
+      # Pick up anything the new version reads from history (cheap: stored files are skipped).
+      sudo -u aikeeper /usr/local/bin/aikeeper-env backfill --days 3 || log "update backfill had errors"
+      log "update complete: $(git rev-parse --short HEAD)"
+    else
+      log "UPDATE BUILD FAILED; keeping the running version"
+    fi
+  else
+    log "code is current: $(git rev-parse --short HEAD)"
+  fi
 fi
 
 # Every boot: email settings from metadata (empty values leave the file's value alone).
@@ -55,3 +77,14 @@ if [ -f "$ENV" ]; then
 fi
 systemctl restart aikeeper
 log "service restarted: $(systemctl is-active aikeeper)"
+
+# A one-off test brief: set metadata `aik-send-test-brief` to any new value and restart the VM.
+TOKEN="$(md aik-send-test-brief)"
+if [ -n "$TOKEN" ] && [ ! -f "/var/lib/aikeeper-test-brief-$TOKEN" ]; then
+  if sudo -u aikeeper /usr/local/bin/aikeeper-env brief --send; then
+    touch "/var/lib/aikeeper-test-brief-$TOKEN"
+    log "test brief sent ($TOKEN)"
+  else
+    log "TEST BRIEF FAILED ($TOKEN)"
+  fi
+fi

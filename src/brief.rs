@@ -170,6 +170,26 @@ pub fn build(store: &Store, now: i64) -> Result<(String, String)> {
         writeln!(b, "  Keeper deposit-width feed: {n}")?;
     }
 
+    // 5b. Alerts of the last day, and whether the A.I's copy of the keeper's rules still matches.
+    let alerts: Vec<(i64, String, String, String)> = {
+        let mut st = store.db.prepare("SELECT ts, key, state, message FROM alerts WHERE ts > ?1 ORDER BY ts")?;
+        let rows = st.query_map([since], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    if alerts.is_empty() {
+        writeln!(b, "  Alerts: none in the last 24 h")?;
+    }
+    for (t, key, state, msg) in alerts {
+        let at = chrono::DateTime::from_timestamp(t, 0).map(|d| d.format("%H:%M").to_string()).unwrap_or_default();
+        writeln!(b, "  Alert {at} UTC [{state}] {key}: {msg}")?;
+    }
+    let fid = crate::registry::fidelity(store)?;
+    writeln!(
+        b,
+        "  Keeper-rules check: {} of {} width choices, {} of {} out-of-range clocks, {} of {} rebalance times and {} of {} rebalance widths reproduced",
+        fid.choices.0, fid.choices.1, fid.clocks.0, fid.clocks.1, fid.rebalances.0, fid.rebalances.1, fid.widths.0, fid.widths.1
+    )?;
+
     // 6. Owner notes.
     let notes: Vec<String> = {
         let mut st = store.db.prepare("SELECT text FROM notes WHERE ts > ?1 ORDER BY ts")?;
@@ -182,7 +202,7 @@ pub fn build(store: &Store, now: i64) -> Result<(String, String)> {
             writeln!(b, "  - {n}")?;
         }
     }
-    writeln!(b, "\nReply to this email or run `aikeeper note \"...\"` to teach it; notes are kept with the day's decisions.")?;
+    writeln!(b, "\nReply to this email to teach it: your reply is read within 10 minutes and kept with the day's decisions.")?;
     Ok((subject, b))
 }
 

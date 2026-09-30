@@ -53,22 +53,46 @@ CREATE INDEX IF NOT EXISTS predictions_kind ON predictions (kind, model, made_ts
 CREATE TABLE IF NOT EXISTS shadow (
   made_ts INTEGER PRIMARY KEY, start_tick REAL NOT NULL, position_usd REAL,
   keeper_choice INTEGER NOT NULL, ai_choice INTEGER NOT NULL, keeper_vol REAL, ai_vol REAL, ai_model TEXT,
-  detail TEXT, keeper_net_per_day REAL, ai_net_per_day REAL, best_hindsight INTEGER, best_net REAL, resolved_ts INTEGER
+  detail TEXT, keeper_net_per_day REAL, ai_net_per_day REAL, best_hindsight INTEGER, best_net REAL, replay TEXT, resolved_ts INTEGER
 );
 
 -- Every model's own width choice for each shadow decision, graded like the champion's, so shadow
 -- mode is informative from day one (before a champion has emerged every model still competes).
 CREATE TABLE IF NOT EXISTS shadow_model (
-  made_ts INTEGER NOT NULL, model TEXT NOT NULL, vol REAL NOT NULL, choice INTEGER NOT NULL, net_per_day REAL,
+  made_ts INTEGER NOT NULL, model TEXT NOT NULL, vol REAL NOT NULL, choice INTEGER NOT NULL, net_per_day REAL, replay TEXT,
   PRIMARY KEY (made_ts, model)
 );
 
--- What the owner tells it (CLI `note`, later email replies).
+-- What the owner tells it (CLI `note`, and replies to the brief read from the inbox).
 CREATE TABLE IF NOT EXISTS notes (ts INTEGER NOT NULL, text TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS inbox_seen (message_id TEXT PRIMARY KEY, ts INTEGER NOT NULL);
+
+-- Every alert raised and cleared (see alerts.rs).
+CREATE TABLE IF NOT EXISTS alerts (ts INTEGER NOT NULL, key TEXT NOT NULL, state TEXT NOT NULL, message TEXT NOT NULL);
 
 -- Fitted model parameters and small bits of state.
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 "#;
+
+/// Columns added after a database may already exist on disk (CREATE TABLE IF NOT EXISTS does not
+/// add columns). Each is added once if missing.
+const MIGRATIONS: &[(&str, &str, &str)] = &[
+    ("pool_obs", "reward_rate", "REAL"),
+    ("shadow", "best_net", "REAL"),
+    ("shadow", "replay", "TEXT"),
+    ("shadow_model", "replay", "TEXT"),
+];
+
+pub fn migrate(db: &Connection) -> Result<()> {
+    for (table, column, ty) in MIGRATIONS {
+        let mut st = db.prepare(&format!("PRAGMA table_info({table})"))?;
+        let have: Vec<String> = st.query_map([], |r| r.get::<_, String>(1))?.collect::<std::result::Result<_, _>>()?;
+        if !have.iter().any(|c| c == column) {
+            db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty}"))?;
+        }
+    }
+    Ok(())
+}
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
@@ -77,6 +101,7 @@ impl Store {
         }
         let db = Connection::open(path)?;
         db.execute_batch(SCHEMA)?;
+        migrate(&db)?;
         Ok(Store { db })
     }
 
@@ -129,6 +154,34 @@ impl Store {
             match out.last() {
                 Some((lm, _)) if *lm == m => {}
                 _ => out.push((m, t)),
+            }
+        }
+        Ok(out)
+    }
+
+    /// One-minute pool path in [from, to) as (ts, tick, fee_pips): the A.I's own reads (with the
+    /// pool's fee), the keeper's market_ticks (with its fee reading), and last the price series.
+    pub fn pool_path(&self, from: i64, to: i64) -> Result<Vec<(i64, f64, Option<f64>)>> {
+        let mut st = self.db.prepare_cached(
+            "SELECT ts / 60 * 60 AS m, CAST(tick AS REAL), CAST(fee_pips AS REAL), 0 AS pri FROM pool_obs WHERE ts >= ?1 AND ts < ?2
+             UNION ALL
+             SELECT ts / 60 * 60, CAST(json_extract(json, '$.tick') AS REAL), CAST(json_extract(json, '$.fee_pips') AS REAL), 1
+               FROM keeper_rows WHERE tbl = 'market_ticks' AND ts >= ?1 AND ts < ?2
+             UNION ALL
+             SELECT ts / 60 * 60, tick, NULL, 2 FROM price_1m WHERE source = 'pool' AND tick IS NOT NULL AND ts >= ?1 AND ts < ?2
+             ORDER BY 1, 4",
+        )?;
+        let rows = st.query_map(params![from, to], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?, r.get::<_, Option<f64>>(2)?)))?;
+        let mut out: Vec<(i64, f64, Option<f64>)> = Vec::new();
+        for row in rows {
+            let (m, t, f) = row?;
+            match out.last_mut() {
+                Some(last) if last.0 == m => {
+                    if last.2.is_none() {
+                        last.2 = f;
+                    }
+                }
+                _ => out.push((m, t, f)),
             }
         }
         Ok(out)

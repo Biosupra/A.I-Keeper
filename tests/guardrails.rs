@@ -90,6 +90,37 @@ fn web_client_has_no_write_verbs() {
 }
 
 #[test]
+fn mail_is_read_only_and_owner_only() {
+    let inbox = fs::read_to_string("src/inbox.rs").unwrap();
+    // EXAMINE is IMAP's read-only open; these would change the mailbox.
+    for verb in [
+        ".select(",
+        ".store(",
+        ".uid_store(",
+        ".expunge(",
+        ".append(",
+        ".copy(",
+        ".uid_copy(",
+        ".mv(",
+        ".uid_mv(",
+        ".delete(",
+        ".create(",
+        ".rename(",
+    ] {
+        assert!(!inbox.contains(verb), "src/inbox.rs must not call {verb}");
+    }
+    assert!(inbox.contains(".examine(\"INBOX\")"), "the inbox is opened read-only with EXAMINE");
+    assert!(inbox.contains("BODY.PEEK[]"), "messages are fetched with BODY.PEEK so nothing is marked read");
+    assert!(inbox.contains("guard::check_host"), "the IMAP host passes the host allowlist");
+    // Raw sockets only in the inbox (every other connection goes through net.rs or lettre).
+    let mut files = Vec::new();
+    walk(Path::new("src"), &mut files);
+    for f in files.iter().filter(|f| !f.ends_with("inbox.rs")) {
+        assert!(!fs::read_to_string(f).unwrap().contains("TcpStream"), "{} opens a raw socket", f.display());
+    }
+}
+
+#[test]
 fn no_secrets_committed() {
     for f in [".env", "data/aikeeper.sqlite"] {
         assert!(
