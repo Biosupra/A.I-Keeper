@@ -18,7 +18,8 @@ ProtectHome=true
 PrivateTmp=true
 ReadWritePaths=/var/lib/aikeeper
 CapabilityBoundingSet=
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# AF_NETLINK: glibc's resolver may query interfaces over netlink.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 
 [Install]
 WantedBy=multi-user.target

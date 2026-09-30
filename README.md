@@ -35,7 +35,7 @@ of real pool prices under the keeper's **exact** rules, ported from the live kee
 own start-up log: 5-minute TWAP trigger, 6 h confirmation, cooldown and daily cap, the fee/deviation
 hold, the crash valve, in-range re-cuts, and its "±2% unless clearly better" width choice. The only
 difference between the strategies is the volatility view each acts on. `aikeeper verify` checks the
-copy against the keeper's own history; on 2026-09-30 it reproduced **185 of 185** width choices,
+copy against the keeper's own history; on 2026-09-29 it reproduced **185 of 185** width choices,
 **14 of 14** out-of-range clocks and the one real rebalance to **11 seconds** with the same new width.
 Details in [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md).
 
@@ -65,6 +65,6 @@ alert watches the project. Email goes out through Gmail with an app password. St
 
 ## Status
 
-Deployed 2026-09-30 on Google Cloud (project `pf-ai-keeper`, VM `aikeeper`). Collectors, six volatility
+Deployed 2026-09-29 on Google Cloud (project `pf-ai-keeper`, VM `aikeeper`). Collectors, six volatility
 models, range-exit models, exact-rules shadow mode, scorecard, alerts, reply reading, daily brief,
 guardrails. What is deliberately not built yet, and why: [docs/ROADMAP.md](docs/ROADMAP.md).

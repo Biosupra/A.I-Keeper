@@ -80,7 +80,7 @@ at each real position's size (gas weighs more on small positions).
 
 **Fidelity check (`aikeeper verify`, and in every brief):** width choices reproduced, out-of-range
 clocks within 10 minutes of the keeper's own log, real rebalance times within 10 minutes, and their
-new widths at the real position size. 2026-09-30: 185/185, 14/14, 1/1 (11 s), 1/1. If the keeper's
+new widths at the real position size. 2026-09-29: 185/185, 14/14, 1/1 (11 s), 1/1. If the keeper's
 rules change, the rule-drift alert fires.
 
 ## Alerts (`src/alerts.rs`)

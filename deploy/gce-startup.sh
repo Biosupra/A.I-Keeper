@@ -28,12 +28,13 @@ if [ ! -f "$DONE" ]; then
   cd /opt/aikeeper-src
   log "building (15-30 min on an e2-micro)"
   if ! cargo build --release; then log "BUILD FAILED"; exit 1; fi
-  ./deploy/install.sh
+  # Run through bash: a checkout from Windows may carry no executable bit.
+  if ! bash ./deploy/install.sh; then log "INSTALL FAILED"; exit 1; fi
   log "selftest"
-  sudo -u aikeeper /usr/local/bin/aikeeper-env selftest || true
+  sudo -u aikeeper /usr/local/bin/aikeeper-env selftest || log "selftest reported problems"
   log "backfill (a year of prices, the keeper's history; ~45 min)"
   sudo -u aikeeper /usr/local/bin/aikeeper-env backfill --days 365 || log "backfill had errors (the daemon keeps collecting)"
-  systemctl enable aikeeper
+  systemctl enable aikeeper || { log "ENABLE FAILED"; exit 1; }
   touch "$DONE"
   log "first boot complete"
 else
@@ -41,15 +42,21 @@ else
   # running version (install.sh is only reached after a successful build).
   export PATH=/root/.cargo/bin:$PATH
   cd /opt/aikeeper-src
-  if git fetch --depth 1 origin main && [ "$(git rev-parse HEAD)" != "$(git rev-parse FETCH_HEAD)" ]; then
+  git fetch --depth 1 origin main || log "git fetch failed"
+  if [ "$(git rev-parse HEAD)" != "$(git rev-parse FETCH_HEAD 2>/dev/null || git rev-parse HEAD)" ] || [ ! -x /usr/local/bin/aikeeper ] || [ ! -f /etc/systemd/system/aikeeper.service ]; then
     log "update: $(git rev-parse --short HEAD) -> $(git rev-parse --short FETCH_HEAD)"
-    git reset --hard FETCH_HEAD
+    git reset --hard FETCH_HEAD 2>/dev/null || true
     if cargo build --release; then
-      systemctl stop aikeeper || true
-      ./deploy/install.sh
-      # Pick up anything the new version reads from history (cheap: stored files are skipped).
-      sudo -u aikeeper /usr/local/bin/aikeeper-env backfill --days 3 || log "update backfill had errors"
-      log "update complete: $(git rev-parse --short HEAD)"
+      systemctl stop aikeeper 2>/dev/null || true
+      if bash ./deploy/install.sh; then
+        systemctl enable aikeeper || log "ENABLE FAILED"
+        # Fill any history the new version reads (cheap when already held: stored minutes and
+        # files are skipped).
+        sudo -u aikeeper /usr/local/bin/aikeeper-env backfill --days 365 || log "update backfill had errors"
+        log "update complete: $(git rev-parse --short HEAD)"
+      else
+        log "INSTALL FAILED; keeping the running version"
+      fi
     else
       log "UPDATE BUILD FAILED; keeping the running version"
     fi
@@ -60,13 +67,14 @@ fi
 
 # Every boot: email settings from metadata (empty values leave the file's value alone).
 ENV=/etc/aikeeper.env
-set_var() { # name value
+set_var() { # name value — written double-quoted: the Gmail app password contains spaces, and
+  # both bash (aikeeper-env) and systemd (EnvironmentFile) read quoted values correctly.
   [ -z "$2" ] && return
+  local v="$2"; v="${v//\\/}"; v="${v//\"/}"; v="${v//|/}" # no backslash, quote or | ever reaches the file
   if grep -q "^$1=" "$ENV"; then
-    # Values never contain '|'; Gmail app passwords are letters and spaces.
-    sed -i "s|^$1=.*|$1=$2|" "$ENV"
+    sed -i "s|^$1=.*|$1=\"$v\"|" "$ENV"
   else
-    echo "$1=$2" >> "$ENV"
+    echo "$1=\"$v\"" >> "$ENV"
   fi
 }
 if [ -f "$ENV" ]; then
@@ -76,7 +84,8 @@ if [ -f "$ENV" ]; then
   chmod 0640 "$ENV" && chgrp aikeeper "$ENV"
 fi
 systemctl restart aikeeper
-log "service restarted: $(systemctl is-active aikeeper)"
+sleep 5
+log "service: $(systemctl is-active aikeeper)"
 
 # A one-off test brief: set metadata `aik-send-test-brief` to any new value and restart the VM.
 TOKEN="$(md aik-send-test-brief)"

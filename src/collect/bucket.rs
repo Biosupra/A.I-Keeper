@@ -10,7 +10,7 @@
 //!   * position_events and keeper_runs in full (sparse: files exist only when something happened),
 //!   * width_evals: one file per 10 minutes (the newest in each 10-minute slot). The shadow replay
 //!     needs the table the keeper acted on: with hourly tables a rebalance's new width came out
-//!     wrong on real data (2026-09-30: +/-6% vs the keeper's +/-4.5%); with the minute tables it is
+//!     wrong on real data (2026-09-29: +/-6% vs the keeper's +/-4.5%); with the minute tables it is
 //!     exact, and the keeper's table moves little inside 10 minutes. ~4,300 reads a month;
 //!   * keeper_decisions: one file per hour (the newest in each hour folder),
 //!   * market_ticks: nothing live (the A.I reads the pool itself every 30 s), except in `History`

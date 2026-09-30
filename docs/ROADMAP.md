@@ -4,7 +4,7 @@ Owner's decisions (2026-09-28): shadow mode from day one, data 24/7, $0 budget (
 $0.003/month of bucket reads), Rust, Google Cloud next to the bucket, daily brief by email, news
 tagging later. Hands tied until the owner says otherwise (see GUARDRAILS.md).
 
-## Built and running (2026-09-30)
+## Built and running (2026-09-29)
 - Guardrails in code and CI: no keys, read-only RPC allowlist, host allowlist, GET-only web,
   read-only mail
 - Collectors: pool on Base every 30 s (price, liquidity, fee, gas, AERO emission rate), Coinbase
