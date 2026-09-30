@@ -32,8 +32,8 @@ if [ ! -f "$DONE" ]; then
   if ! bash ./deploy/install.sh; then log "INSTALL FAILED"; exit 1; fi
   log "selftest"
   sudo -u aikeeper /usr/local/bin/aikeeper-env selftest || log "selftest reported problems"
-  log "backfill (a year of prices, the keeper's history; ~45 min)"
-  sudo -u aikeeper /usr/local/bin/aikeeper-env backfill --days 365 || log "backfill had errors (the daemon keeps collecting)"
+  log "backfill (3 years of ETH, a year of the rest, the keeper's history, then the replay; ~60-90 min)"
+  sudo -u aikeeper /usr/local/bin/aikeeper-env backfill || log "backfill had errors (the daemon keeps collecting)"
   systemctl enable aikeeper || { log "ENABLE FAILED"; exit 1; }
   touch "$DONE"
   log "first boot complete"
@@ -103,5 +103,5 @@ fi
 # same database safely: whatever is already held is skipped, and every range is written once).
 if [ "$UPDATED" = 1 ]; then
   log "update backfill started (service running)"
-  sudo -u aikeeper /usr/local/bin/aikeeper-env backfill --days 365 && log "update backfill complete" || log "update backfill had errors (run it again to continue)"
+  sudo -u aikeeper /usr/local/bin/aikeeper-env backfill && log "update backfill complete" || log "update backfill had errors (run it again to continue)"
 fi

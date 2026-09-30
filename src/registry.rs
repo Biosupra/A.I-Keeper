@@ -24,8 +24,8 @@ pub struct MadeSummary {
 #[allow(clippy::too_many_arguments)]
 fn insert(store: &Store, made: i64, target: i64, kind: &str, model: &str, key: &str, value: f64, inputs: &Value) -> Result<()> {
     store.db.execute(
-        "INSERT INTO predictions (made_ts, target_ts, kind, model, key, value, inputs) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![made, target, kind, model, key, value, inputs.to_string()],
+        "INSERT INTO predictions (made_ts, target_ts, kind, model, key, value, inputs, regime) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![made, target, kind, model, key, value, inputs.to_string(), inputs["regime"].as_str()],
     )?;
     Ok(())
 }
@@ -45,7 +45,7 @@ pub fn make_predictions(store: &Store, now: i64) -> Result<MadeSummary> {
     }
     let f24 = vol::forecasts(store, now, 24)?;
     let f1 = vol::forecasts(store, now, 1)?;
-    let inputs = json!({ "vol24h": f24, "vol1h": f1 });
+    let inputs = json!({ "vol24h": f24, "vol1h": f1, "regime": current_regime(store, now)? });
     for (m, v) in &f24 {
         insert(store, now, now + 86_400, "vol24h", m, "", *v, &inputs)?;
     }
@@ -104,15 +104,52 @@ pub fn pool_basis(store: &Store, now: i64, coinbase_keeper_style: Option<f64>) -
     Ok(Some(a.max(b) / c))
 }
 
-/// The volatility model with the best 24 h QLIKE over the last 30 days (at least 10 grades),
-/// or `blend`, or the keeper's own estimator while nothing has been graded yet.
+/// The market regime at `now` (calm / active / storm) by the last 24 h of Coinbase volatility.
+pub fn current_regime(store: &Store, now: i64) -> Result<Option<&'static str>> {
+    let prices = store.prices("coinbase", now - 86_400, now)?;
+    Ok(vol::realised(&prices, now - 86_400, now).map(vol::regime))
+}
+
+/// (model, hours, mean loss).
+pub type ModelScore = (String, i64, f64);
+
+/// Each model's mean 24 h QLIKE over every hour of one regime the A.I holds (live and replayed),
+/// PAIRED: only hours in which every model forecast count (HAR needs 90 days of history and DVOL
+/// can be missing, so unpaired means would compare different hours). Best first.
+pub fn regime_scores(store: &Store, regime: &str, now: i64) -> Result<Vec<ModelScore>> {
+    let mut st = store.db.prepare_cached(
+        "WITH hours AS (
+           SELECT made_ts, COUNT(DISTINCT model) AS n FROM predictions
+           WHERE kind = 'vol24h' AND regime = ?1 AND score IS NOT NULL AND made_ts > ?2 AND target_ts <= ?3
+           GROUP BY made_ts
+         ), paired AS (SELECT made_ts FROM hours WHERE n = (SELECT MAX(n) FROM hours))
+         SELECT model, COUNT(*), AVG(score) FROM predictions
+         WHERE kind = 'vol24h' AND score IS NOT NULL AND made_ts IN (SELECT made_ts FROM paired)
+         GROUP BY model ORDER BY AVG(score) ASC",
+    )?;
+    let rows = st.query_map(params![regime, 0, now], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// The volatility model the A.I follows. First choice: the best 24 h QLIKE over all history held
+/// among forecasts made in the SAME regime as now, paired over at least 50 hours; the replayed
+/// years (`crate::replay`) supply these, so a model that fails in storms loses storms even
+/// before a live storm. Otherwise the best over the last 30 days (at least 10 grades); otherwise
+/// the keeper's own estimator. Only forecasts whose outcome was known at `now` count.
 pub fn champion(store: &Store, now: i64) -> Result<String> {
+    if let Some(r) = current_regime(store, now)? {
+        if let Some((m, n, _)) = regime_scores(store, r, now)?.into_iter().next() {
+            if n >= 50 {
+                return Ok(m);
+            }
+        }
+    }
     let best: Option<String> = store
         .db
         .query_row(
-            "SELECT model FROM predictions WHERE kind = 'vol24h' AND score IS NOT NULL AND made_ts > ?1
+            "SELECT model FROM predictions WHERE kind = 'vol24h' AND score IS NOT NULL AND made_ts > ?1 AND target_ts <= ?2
              GROUP BY model HAVING COUNT(*) >= 10 ORDER BY AVG(score) ASC LIMIT 1",
-            [now - 30 * 86_400],
+            [now - 30 * 86_400, now],
             |r| r.get(0),
         )
         .ok();
@@ -607,7 +644,7 @@ pub struct ShadowScore {
 
 pub fn scorecard(store: &Store, now: i64, days: i64) -> Result<(Vec<ScoreLine>, Option<ShadowScore>)> {
     let mut st = store.db.prepare(
-        "SELECT kind, model, COUNT(*), AVG(score) FROM predictions WHERE score IS NOT NULL AND made_ts > ?1
+        "SELECT kind, model, COUNT(*), AVG(score) FROM predictions WHERE score IS NOT NULL AND made_ts > ?1 AND replay IS NULL
          GROUP BY kind, model ORDER BY kind, AVG(score)",
     )?;
     let lines = st
@@ -799,9 +836,40 @@ mod tests {
     }
 
     #[test]
+    fn regime_scores_compare_the_same_hours() {
+        // dvol forecast all 100 hours: easy ones (loss 0.5) then hard ones (2.0). HAR only exists
+        // for the hard half (loss 1.5). Unpaired, dvol's easy hours would make it look better
+        // (1.25 vs 1.5); paired on the hours both forecast, HAR is better (1.5 vs 2.0).
+        let s = Store::memory().unwrap();
+        let ins = |t: i64, m: &str, score: f64| {
+            s.db.execute(
+                "INSERT INTO predictions (made_ts, target_ts, kind, model, key, value, score, regime) VALUES (?1, ?2, 'vol24h', ?3, '', 0.005, ?4, 'calm')",
+                params![t, t + 86_400, m, score],
+            )
+            .unwrap();
+        };
+        let t0 = 1_700_000_000;
+        for i in 0..100 {
+            let t = t0 + i * 3600;
+            ins(t, "dvol", if i < 50 { 0.5 } else { 2.0 });
+            if i >= 50 {
+                ins(t, "har", 1.5);
+            }
+        }
+        let now = t0 + 200 * 86_400;
+        let r = regime_scores(&s, "calm", now).unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!((r[0].0.as_str(), r[0].1), ("har", 50));
+        assert!((r[0].2 - 1.5).abs() < 1e-12 && (r[1].2 - 2.0).abs() < 1e-12, "{r:?}");
+        assert!(regime_scores(&s, "storm", now).unwrap().is_empty());
+        // Forecasts whose outcome was not yet known at `now` do not count.
+        assert!(regime_scores(&s, "calm", t0).unwrap().is_empty());
+    }
+
+    #[test]
     fn migrations_add_missing_columns() {
         let db = rusqlite::Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE pool_obs (ts INTEGER PRIMARY KEY); CREATE TABLE shadow (made_ts INTEGER PRIMARY KEY); CREATE TABLE shadow_model (made_ts INTEGER, model TEXT); CREATE TABLE price_1m (source TEXT, ts INTEGER, close REAL);").unwrap();
+        db.execute_batch("CREATE TABLE pool_obs (ts INTEGER PRIMARY KEY); CREATE TABLE shadow (made_ts INTEGER PRIMARY KEY); CREATE TABLE shadow_model (made_ts INTEGER, model TEXT); CREATE TABLE price_1m (source TEXT, ts INTEGER, close REAL); CREATE TABLE predictions (id INTEGER PRIMARY KEY, kind TEXT, model TEXT, made_ts INTEGER);").unwrap();
         crate::store::migrate(&db).unwrap();
         crate::store::migrate(&db).unwrap(); // idempotent
         let cols = |t: &str| -> Vec<String> {
@@ -809,6 +877,7 @@ mod tests {
             st.query_map([], |r| r.get::<_, String>(1)).unwrap().map(|c| c.unwrap()).collect()
         };
         assert!(cols("pool_obs").contains(&"reward_rate".to_string()));
+        assert!(cols("predictions").contains(&"regime".to_string()) && cols("predictions").contains(&"replay".to_string()));
         assert!(cols("shadow").contains(&"replay".to_string()) && cols("shadow").contains(&"best_net".to_string()));
         assert!(cols("shadow_model").contains(&"replay".to_string()));
         // Full capture (2026-09-30): an old database gains the new columns too.

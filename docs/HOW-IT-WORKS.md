@@ -11,7 +11,7 @@ Since 2026-09-30 it captures everything it can ("watch EVERYTHING"):
 | Pool + gauge event logs (`src/collect/flow.rs`) | every log, gzipped as received (~8 MB a day); swaps decoded; Mint/Burn/Collect/CollectFees/Flash and gauge stake/unstake/claim/notify/penalty summed per minute | 30 s (cursor; up to 3 × 1,999 blocks per turn; full history since the vault's deploy block by `backfill`) | `chain_log_archive`, `swaps`, `lp_minute`, `gauge_minute` |
 | Pool `ticks()` (`src/collect/liquidity.rs`) | gross, net and **staked** net liquidity of every initialized tick within ±40 spacings (±20%) | 10 min | `tick_liquidity` |
 | Gauge, pool, Voter | periodFinish, left, rewardRateByEpoch, fees, rewardReserve, gaugeFees, the pool's vote weight and the total; the keeper wallet's ETH | 1 h | `series` (sources `gauge`, `keeper`) |
-| Coinbase Exchange | one-minute candles with volume: ETH-USD, BTC-USD, AERO-USD, ETH-BTC | 1 min (+ a year of backfill) | `price_1m` (sources `coinbase`, `cb:<product>`) |
+| Coinbase Exchange | one-minute candles with volume: ETH-USD, BTC-USD, AERO-USD, ETH-BTC | 1 min (+ three years of ETH-USD backfill, a year of the others) | `price_1m` (sources `coinbase`, `cb:<product>`) |
 | Coinbase Exchange | ETH-USD order book: mid, spread, depth and imbalance within 0.1/0.5/1/2% | 5 min | `series` (`coinbase_book`) |
 | Deribit | ETH DVOL; BTC DVOL; ETH and BTC perpetual funding, open interest, mark, index, 24 h volume; every ETH option's IV, price, open interest | 1 h / 5 min / 1 h | `dvol`, `series` (`deribit`), `options_hourly` |
 | DefiLlama yields | TVL, APY (base, reward), volume of every Aerodrome pool on Base | 6 h | `pool_yields` |
@@ -95,6 +95,39 @@ at each real position's size (gas weighs more on small positions).
 clocks within 10 minutes of the keeper's own log, real rebalance times within 10 minutes, and their
 new widths at the real position size. 2026-09-29: 185/185, 14/14, 1/1 (11 s), 1/1. If the keeper's
 rules change, the rule-drift alert fires.
+
+## The past, replayed (`src/replay.rs`)
+
+Owner, 2026-09-30: "if it doesn't see the bad times it won't know what not to do." So the A.I does
+not only learn from the days since it started.
+
+**Forecasts, walk-forward.** For every hour of the ETH history it holds (three years by default,
+starting 30 days in), every model forecasts the next 24 h and the next hour with exactly the live
+code (`vol::base_forecasts`), from prices before that hour only; HAR is refitted every 7 days on the
+year before that moment; DVOL is the reading then; the blend is weighted by grades whose outcome was
+already known then (a test proves this equals the live blend, and another rewrites the future into a
+storm and proves no forecast changes). Each forecast is graded like a live one and stored in
+`predictions` with `replay = 1` and its **regime**: calm (< 0.5%/sqrt h over the previous 24 h),
+active (< 1%) or storm. Live forecasts carry the regime too. Hours already forecast live are left
+alone; hours without a complete outcome are skipped and retried.
+
+**Which model to follow.** `registry::champion` picks, for the current regime, the model with the
+lowest mean QLIKE over all history held, **paired**: only hours in which every model forecast count
+(HAR needs 90 days of history, DVOL can be missing, and an unpaired mean would compare easy hours
+with hard ones). At least 50 paired hours; otherwise the 30-day rule. The live scorecard excludes
+replayed forecasts, so it stays the record of what the A.I did live.
+
+**Days, under the keeper's rules.** Every UTC day is replayed with the shadow engine: every width of
+the keeper's table held fixed, and each model's own hourly choices (its forecast scaled to the
+pool's basis, then the keeper's width rule), on the day's real one-minute ETH path, starting a fresh
+$1,000 position at the day's first price. Stored in `replay_day` with the day's realised volatility.
+Assumed for days before the vault (recorded in `replay_runs`): the emission rate, gas and position
+size of the keeper's width table at the median volatility, the pool fee at its median since launch,
+and the pool/Coinbase volatility basis at its median since launch.
+
+The brief's THE PAST, REPLAYED section: the best forecaster per regime next to the keeper's
+estimator, the best and worst fixed width on calm, active and storm days, each model's strategy with
+its worst day, and the three worst days for the keeper-style strategy.
 
 ## Alerts (`src/alerts.rs`)
 

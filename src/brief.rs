@@ -394,6 +394,11 @@ pub fn build(store: &Store, now: i64) -> Result<(String, String)> {
         writeln!(b, "  {what:<32} {:<18} {:.4}  (n={})", l.model, l.mean_score, l.n)?;
     }
 
+    // 4a. The replayed past: good days and bad.
+    if let Some(s) = crate::replay::the_past(store, now)? {
+        b.push_str(&s);
+    }
+
     // 4b. Headlines.
     let news_n = store.count("SELECT COUNT(*) FROM news WHERE ts > ?1", &[&since])?;
     if news_n > 0 {

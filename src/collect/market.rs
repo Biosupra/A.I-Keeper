@@ -159,7 +159,8 @@ pub async fn book(web: &Web, store: &Store, ts: i64) -> Result<()> {
 pub async fn deribit_dvol_for(web: &Web, store: &Store, currency: &str, start: i64, end: i64) -> Result<usize> {
     let mut total = 0;
     let mut until = end * 1000;
-    for _ in 0..20 {
+    // 1,000 hourly points per page, newest first: 60 pages cover almost 7 years.
+    for _ in 0..60 {
         let url = format!(
             "{DERIBIT}/get_volatility_index_data?currency={currency}&start_timestamp={}&end_timestamp={until}&resolution=3600",
             start * 1000

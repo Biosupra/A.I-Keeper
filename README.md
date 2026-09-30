@@ -26,7 +26,7 @@ CI, not left to good behaviour — see [docs/GUARDRAILS.md](docs/GUARDRAILS.md).
 | 10 min | **grades** every forecast and shadow decision whose time has come, against the real price path |
 | 10 min | **alerts** you by email the moment something matters: keeper stopped, keeper gas low, site down, keeper stuck or hitting its runaway guard, the keeper's rules changed, or the A.I's own feeds failing |
 | 10 min | reads **your replies** to the brief (read-only) and keeps them as notes with that day's decisions |
-| night | refits its volatility model on all the history it holds |
+| night | refits its volatility model on all the history it holds, and adds yesterday to the replayed record |
 | day | emails the brief: markets, the pool (flow, competing LPs, staking, emissions, the liquidity map), keeper activity, A.I vs keeper, scorecard, headlines, what it captured, health, your notes |
 
 ### How it learns
@@ -34,6 +34,17 @@ Every forecast goes into a registry with the time it can be checked. When that t
 grades itself (QLIKE for volatility, Brier for range exits). The `blend` model re-weights itself
 toward whichever models have been right over the last 30 days, and shadow mode uses whichever model
 is the current champion. The scorecard is the honest answer to "is it better than the keeper yet?"
+
+It does not wait for bad days to happen live. `aikeeper replay` (run by `backfill` and nightly)
+walks through **three years of ETH history hour by hour**: every model forecasts from what it could
+have seen at that moment only (HAR refitted weekly on the past, the blend weighted only by grades
+already known), is graded on the 24 hours that followed, and is labelled with the kind of market it
+was made in (calm, active, storm). The champion is then chosen **for the kind of market it is now**,
+on the same hours for every model, so a model that falls apart in storms is not followed into one.
+Every day of those years is also replayed under the keeper's current rules for every width and for
+each model's own choices, so the brief can say which widths survive storms and name the worst days.
+Before the vault existed there are no emission figures, so those days are scored with the emission
+rate, gas and pool fee measured since launch (stated in each brief).
 
 ### Shadow mode (from day one)
 Every hour, the keeper's strategy and each A.I model's strategy are replayed over the next 24 hours
@@ -50,7 +61,8 @@ Details in [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md).
 ```
 aikeeper run                 # 24/7 daemon
 aikeeper selftest            # prove the guardrails and read once from every source
-aikeeper backfill --days 365 # a year of ETH minutes, DVOL, the keeper's history
+aikeeper backfill            # 3 years of ETH minutes + DVOL, a year of the rest, the keeper's history, then replay
+aikeeper replay              # replay the past walk-forward (only what is not replayed yet)
 aikeeper predict             # this hour's forecasts and shadow rows now
 aikeeper resolve             # grade what is due
 aikeeper scorecard           # how every model is doing

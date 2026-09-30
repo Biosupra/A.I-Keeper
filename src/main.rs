@@ -15,6 +15,7 @@ mod inbox;
 mod model;
 mod net;
 mod registry;
+mod replay;
 mod run;
 mod store;
 
@@ -35,18 +36,28 @@ enum Cmd {
     Run,
     /// Check the guardrails and read once from every source. Writes nothing outside the data dir.
     Selftest,
-    /// Fill history: a year of ETH, BTC, AERO and ETH-BTC minutes, DVOL (ETH and BTC), Fear & Greed,
-    /// every file in the keeper's bucket since its first day, and every pool/gauge event since the
-    /// vault's deploy block. Safe to run again: whatever is already held is skipped.
+    /// Fill history: three years of ETH minutes and ETH DVOL (what the replay learns from), a year
+    /// of BTC, AERO and ETH-BTC minutes and BTC DVOL, Fear & Greed, every file in the keeper's
+    /// bucket since its first day, and every pool/gauge event since the vault's deploy block; then
+    /// replay it all. Safe to run again: whatever is already held is skipped.
     Backfill {
         #[arg(long, default_value_t = 365)]
         days: i64,
+        /// Days of ETH-USD minutes and ETH DVOL: the replay's history (more storms to learn from).
+        #[arg(long, default_value_t = 1095)]
+        eth_days: i64,
         /// Skip the keeper bucket (e.g. on a laptop without access).
         #[arg(long)]
         no_bucket: bool,
         /// Skip the pool/gauge event history (it reads ~400 block ranges from Base's public node).
         #[arg(long)]
         no_chain: bool,
+    },
+    /// Replay the past walk-forward: every model's forecast for every hour, and every width and
+    /// model strategy on every day, under the keeper's current rules. Only what is not replayed yet.
+    Replay {
+        #[arg(long, default_value_t = 1095)]
+        days: i64,
     },
     /// Make this hour's forecasts and shadow rows now.
     Predict,
@@ -84,7 +95,12 @@ async fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Run => run::daemon(cfg).await,
         Cmd::Selftest => selftest(&cfg, t).await,
-        Cmd::Backfill { days, no_bucket, no_chain } => backfill(&cfg, t, days, no_bucket, no_chain).await,
+        Cmd::Backfill { days, eth_days, no_bucket, no_chain } => backfill(&cfg, t, days, eth_days.max(days), no_bucket, no_chain).await,
+        Cmd::Replay { days } => {
+            let s = store::Store::open(&cfg.db_path())?;
+            println!("{}", replay::run(&s, t, days)?);
+            Ok(())
+        }
         Cmd::Predict => {
             let s = store::Store::open(&cfg.db_path())?;
             let m = registry::make_predictions(&s, t)?;
@@ -285,21 +301,21 @@ async fn selftest(cfg: &config::Config, t: i64) -> Result<()> {
     Ok(())
 }
 
-async fn backfill(cfg: &config::Config, t: i64, days: i64, no_bucket: bool, no_chain: bool) -> Result<()> {
+async fn backfill(cfg: &config::Config, t: i64, days: i64, eth_days: i64, no_bucket: bool, no_chain: bool) -> Result<()> {
     let s = store::Store::open(&cfg.db_path())?;
     let web = net::Web::new()?;
     let rpc = net::Rpc::new(cfg.rpc_urls.clone())?;
-    println!("Coinbase: filling {days} days of one-minute ETH-USD (about {} requests)...", days * 1440 / 300);
-    println!("  {} candles stored", market::coinbase_backfill(&web, &s, t, days).await?);
+    println!("Coinbase: filling {eth_days} days of one-minute ETH-USD (about {} requests)...", eth_days * 1440 / 300);
+    println!("  {} candles stored", market::coinbase_backfill(&web, &s, t, eth_days).await?);
     for p in market::EXTRA_PRODUCTS {
         match market::backfill_product(&web, &s, p, t, days).await {
             Ok(n) => println!("Coinbase {p}: {n} candles stored"),
             Err(e) => println!("Coinbase {p}: {e:#}"),
         }
     }
-    println!("Deribit DVOL: {} hourly points", market::deribit_dvol(&web, &s, t - days * 86_400, t).await.unwrap_or(0));
+    println!("Deribit DVOL: {} hourly points", market::deribit_dvol(&web, &s, t - eth_days * 86_400, t).await.unwrap_or(0));
     println!("Deribit BTC DVOL: {} hourly points", market::deribit_dvol_for(&web, &s, "BTC", t - days * 86_400, t).await.unwrap_or(0));
-    println!("Fear & Greed: {} days", market::fear_greed(&web, &s, days.clamp(1, 3650) as u32).await.unwrap_or(0));
+    println!("Fear & Greed: {} days", market::fear_greed(&web, &s, eth_days.clamp(1, 3650) as u32).await.unwrap_or(0));
     if !no_bucket {
         if let Some(name) = &cfg.bucket {
             let b = bucket::Bucket { web: &web, name: name.clone(), token: cfg.gcs_token.clone() };
@@ -326,6 +342,11 @@ async fn backfill(cfg: &config::Config, t: i64, days: i64, no_bucket: bool, no_c
     match model::har::refit(&s, t)? {
         Some(h) => println!("HAR fitted on {} days: {:?}", h.n, h),
         None => println!("HAR: not enough history yet"),
+    }
+    // The past replayed, so the champion and the brief learn from the bad days too.
+    match replay::run(&s, t, eth_days) {
+        Ok(r) => println!("Replay: {r}"),
+        Err(e) => println!("Replay: {e:#}"),
     }
     println!("Shadow decisions from history: {}", registry::make_shadow(&s, t)?);
     println!("Graded: {}", registry::resolve(&s, t)?);

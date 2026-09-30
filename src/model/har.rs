@@ -96,14 +96,12 @@ pub fn refit(store: &Store, now: i64) -> Result<Option<Har>> {
     Ok(fitted)
 }
 
-/// Next-day forecast as of `now`, from the stored weights and the last 30 days.
-pub fn forecast(store: &Store, prices: &[(i64, f64)], now: i64) -> Result<Option<f64>> {
-    let Some(raw) = store.meta_get("har")? else { return Ok(None) };
-    let h: Har = serde_json::from_str(&raw)?;
+/// Next-day forecast as of `now` with the given weights, from the last 30 days of `prices`.
+pub fn forecast_with(h: &Har, prices: &[(i64, f64)], now: i64) -> Option<f64> {
     let series = daily_series(prices, now, 30);
-    let Some(x) = features(&series, series.len() - 1) else { return Ok(None) };
+    let x = features(&series, series.len() - 1)?;
     let v = h.b0 + h.bd * x[1] + h.bw * x[2] + h.bm * x[3];
-    Ok((v.is_finite() && v > 0.0).then_some(v))
+    (v.is_finite() && v > 0.0).then_some(v)
 }
 
 #[cfg(test)]

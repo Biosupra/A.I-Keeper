@@ -16,6 +16,9 @@ tagging later. Hands tied until the owner says otherwise (see GUARDRAILS.md).
 - Six volatility models incl. HAR (nightly refit) and a self-weighting blend; range-exit odds on two
   price bases
 - Prediction registry with automatic grading and a scorecard
+- The past, replayed (2026-09-30): three years of ETH walked through hour by hour with no lookahead
+  (every model forecast, graded and labelled calm/active/storm), every day replayed under the
+  keeper's rules for every width and model; the champion is chosen per regime on paired hours
 - Shadow mode: keeper vs every model under the keeper's exact rules, graded on real prices, with a
   fidelity check against the keeper's own history
 - Alerts by email; replies to the brief read back as notes; daily brief

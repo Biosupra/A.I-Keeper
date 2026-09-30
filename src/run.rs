@@ -89,6 +89,13 @@ fn bucket_job(cfg: &Config, web: &Web, t: i64, daily: bool) -> Result<()> {
                 Err(e) => tracing::warn!("bucket: {e:#}"),
             }
         }
+        if daily {
+            // Yesterday joins the replayed record (and any hour the daemon missed is filled).
+            match crate::replay::run(&store, now(), 3) {
+                Ok(r) => tracing::info!("replay: {r}"),
+                Err(e) => tracing::warn!("replay: {e:#}"),
+            }
+        }
         match registry::make_shadow(&store, now()) {
             Ok(n) if n > 0 => tracing::info!("shadow: {n} new decisions"),
             Ok(_) => {}

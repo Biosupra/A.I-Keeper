@@ -98,7 +98,7 @@ same page.
 
 ```bash
 sudo -u aikeeper /usr/local/bin/aikeeper-env selftest    # every source + the guardrails
-sudo -u aikeeper /usr/local/bin/aikeeper-env backfill --days 365   # ~30-45 min, once
+sudo -u aikeeper /usr/local/bin/aikeeper-env backfill   # ~60-90 min, once (3 years of ETH, then the replay)
 sudo systemctl enable --now aikeeper
 journalctl -u aikeeper -f        # watch it work
 ```

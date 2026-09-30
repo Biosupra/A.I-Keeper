@@ -170,6 +170,18 @@ CREATE TABLE IF NOT EXISTS news (
   id TEXT PRIMARY KEY, source TEXT NOT NULL, ts INTEGER NOT NULL, title TEXT NOT NULL, link TEXT, summary TEXT, seen_ts INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS news_ts ON news (ts);
+
+-- The past replayed (src/replay.rs): for every day of history, every fixed width and every model's
+-- own width choices run under the keeper's current rules on the real ETH path. strategy is
+-- 'fixed:<half spacings>' or a model name. Emissions and the pool fee before the vault existed
+-- are ASSUMED at the levels measured since (see `assumptions`, one JSON row per replay run).
+CREATE TABLE IF NOT EXISTS replay_day (
+  day INTEGER NOT NULL, strategy TEXT NOT NULL, net_per_day REAL NOT NULL, revenue REAL, costs REAL,
+  divergence REAL, rebalances INTEGER, recuts INTEGER, held_out_minutes INTEGER, in_range REAL,
+  day_vol REAL, prior_vol REAL,
+  PRIMARY KEY (day, strategy)
+);
+CREATE TABLE IF NOT EXISTS replay_runs (ts INTEGER PRIMARY KEY, kind TEXT NOT NULL, assumptions TEXT NOT NULL);
 "#;
 
 /// Columns added after a database may already exist on disk (CREATE TABLE IF NOT EXISTS does not
@@ -189,6 +201,10 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("pool_obs", "period_finish", "INTEGER"),
     ("pool_obs", "gauge_fees0", "TEXT"),
     ("pool_obs", "gauge_fees1", "TEXT"),
+    // The historical replay: the regime each forecast was made in (calm / active / storm, by the
+    // previous 24 h of Coinbase volatility) and whether it was replayed (1) or made live (NULL).
+    ("predictions", "regime", "TEXT"),
+    ("predictions", "replay", "INTEGER"),
 ];
 
 pub fn migrate(db: &Connection) -> Result<()> {
@@ -199,6 +215,8 @@ pub fn migrate(db: &Connection) -> Result<()> {
             db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty}"))?;
         }
     }
+    // Indexes on migrated columns (the columns must exist first).
+    db.execute_batch("CREATE INDEX IF NOT EXISTS predictions_regime ON predictions (kind, regime, made_ts)")?;
     Ok(())
 }
 
