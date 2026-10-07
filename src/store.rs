@@ -240,7 +240,8 @@ pub fn migrate(db: &Connection) -> Result<()> {
     }
     // Indexes on migrated columns (the columns must exist first).
     db.execute_batch("CREATE INDEX IF NOT EXISTS predictions_regime ON predictions (kind, regime, made_ts)")?;
-    for (name, table, cols) in [("keeper_rows_vault", "keeper_rows", "vault, tbl, ts"), ("position_min_vault", "position_min", "vault, ts")] {
+    for (name, table, cols) in [("keeper_rows_vault", "keeper_rows", "vault, tbl, ts"), ("position_min_vault", "position_min", "vault, ts")]
+    {
         let exists: i64 = db.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1", [table], |r| r.get(0))?;
         if exists > 0 {
             db.execute_batch(&format!("CREATE INDEX IF NOT EXISTS {name} ON {table} ({cols})"))?;

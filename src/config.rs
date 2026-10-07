@@ -92,9 +92,7 @@ impl Config {
             predict_every_secs: num("AIK_PREDICT_EVERY_SECS", 3600),
             disk_budget_gb: num("AIK_DISK_BUDGET_GB", 20.0),
             chain_start_block: num("AIK_CHAIN_START_BLOCK", 51_189_251),
-            primary_vault: var("AIK_PRIMARY_VAULT")
-                .unwrap_or_else(|| crate::collect::bucket::PRIMARY_DEFAULT.into())
-                .to_lowercase(),
+            primary_vault: var("AIK_PRIMARY_VAULT").unwrap_or_else(|| crate::collect::bucket::PRIMARY_DEFAULT.into()).to_lowercase(),
         }
     }
 

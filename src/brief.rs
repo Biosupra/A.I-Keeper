@@ -76,7 +76,7 @@ fn commas(x: f64) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -174,7 +174,8 @@ struct VaultDay {
 fn vault_day(store: &Store, vault: &str, since: i64, now: i64) -> Result<VaultDay> {
     let mut d = VaultDay { vault: vault.to_string(), ..Default::default() };
     let events: Vec<Value> = {
-        let mut st = store.db.prepare("SELECT json FROM keeper_rows WHERE tbl = 'position_events' AND vault = ?2 AND ts > ?1 ORDER BY ts")?;
+        let mut st =
+            store.db.prepare("SELECT json FROM keeper_rows WHERE tbl = 'position_events' AND vault = ?2 AND ts > ?1 ORDER BY ts")?;
         let r = st.query_map(rusqlite::params![since, vault], |r| r.get::<_, String>(0))?;
         r.filter_map(|x| x.ok()).filter_map(|s| serde_json::from_str(&s).ok()).collect()
     };
@@ -221,11 +222,9 @@ fn vault_day(store: &Store, vault: &str, since: i64, now: i64) -> Result<VaultDa
     }
     let width: Option<(i64, String)> = store
         .db
-        .query_row(
-            "SELECT ts, json FROM keeper_rows WHERE tbl = 'width_evals' AND vault = ?1 ORDER BY ts DESC LIMIT 1",
-            [vault],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+        .query_row("SELECT ts, json FROM keeper_rows WHERE tbl = 'width_evals' AND vault = ?1 ORDER BY ts DESC LIMIT 1", [vault], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
         .ok();
     d.width = width.and_then(|(ts, raw)| {
         let v: Value = serde_json::from_str(&raw).ok()?;
@@ -372,7 +371,7 @@ fn pool_section(b: &mut String, store: &Store, since: i64, now: i64, vaults: &[V
                 writeln!(
                     b,
                     "  {}: in-range positions hold {:.4}% of the staked liquidity at the price (their share of the emissions right now)",
-                    vault_name(&d.vault),
+                    capitalise(&vault_name(&d.vault)),
                     d.in_range_liquidity / staked * 100.0
                 )?;
             }
@@ -516,9 +515,8 @@ pub fn build(store: &Store, now: i64, primary: &str) -> Result<(String, String)>
         let name = vault_name(&d.vault);
         let mut line = match d.snapshot_ts {
             Some(_) => format!(
-                "• {}{}: {} worth {} in total, {} earning rewards right now",
-                capitalise(&name),
-                if d.vault == primary { " (the live one)" } else { "" },
+                "• {}: {} worth {} in total, {} earning rewards right now",
+                title(&d.vault, primary),
                 plural(d.positions, "position", "positions"),
                 money(d.positions_usd),
                 d.in_range
@@ -547,7 +545,7 @@ pub fn build(store: &Store, now: i64, primary: &str) -> Result<(String, String)>
     // ---------- 2. the vaults ----------
     writeln!(b, "\nYOUR VAULTS")?;
     for d in &vaults {
-        writeln!(b, "{}{}", capitalise(&vault_name(&d.vault)), if d.vault == primary { " (the live vault)" } else { "" })?;
+        writeln!(b, "{}", title(&d.vault, primary))?;
         match activity_words(d) {
             Some(a) => writeln!(b, "  In the last 24 hours: {a}.")?,
             None => writeln!(b, "  In the last 24 hours: nothing happened (no deposits, top-ups, withdrawals or range moves).")?,
@@ -622,7 +620,12 @@ pub fn build(store: &Store, now: i64, primary: &str) -> Result<(String, String)>
     }
     let (swaps_n, swap_vol, ..) = swap_totals(store, since)?;
     if swaps_n > 0 {
-        writeln!(b, "  Our pool (WETH/USDC on Aerodrome) traded {} in {} swaps.", usd_short(swap_vol.unwrap_or(0.0)), commas(swaps_n as f64))?;
+        writeln!(
+            b,
+            "  Our pool (WETH/USDC on Aerodrome) traded {} in {} swaps.",
+            usd_short(swap_vol.unwrap_or(0.0)),
+            commas(swaps_n as f64)
+        )?;
     }
     if let Some((_, staked, Some(rate), aero)) = pool_obs(store, now) {
         let per_day = rate * 86_400.0;
@@ -645,7 +648,9 @@ pub fn build(store: &Store, now: i64, primary: &str) -> Result<(String, String)>
         if staked > 0.0 {
             let share: f64 = vaults.iter().map(|d| d.in_range_liquidity).sum::<f64>() / staked;
             if share > 0.0 {
-                let earn = aero.map(|a| format!(", roughly {} a day for everyone in Panda together", money(share * per_day * a))).unwrap_or_default();
+                let earn = aero
+                    .map(|a| format!(", roughly {} a day for everyone in Panda together", money(share * per_day * a)))
+                    .unwrap_or_default();
                 writeln!(b, "  Panda's earning positions get {} of those rewards right now{earn}.", share_words(share))?;
             }
         }
@@ -807,6 +812,16 @@ pub fn build(store: &Store, now: i64, primary: &str) -> Result<(String, String)>
     Ok((subject, b))
 }
 
+/// "The new vault (0x6198…93a8, the live one)", "The original vault".
+fn title(vault: &str, primary: &str) -> String {
+    let name = capitalise(&vault_name(vault));
+    match (vault == primary, name.strip_suffix(')')) {
+        (true, Some(open)) => format!("{open}, the live one)"),
+        (true, None) => format!("{name} (the live one)"),
+        (false, _) => name,
+    }
+}
+
 fn capitalise(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {
@@ -861,7 +876,15 @@ fn ai_verdict(s: &registry::ShadowScore) -> String {
 }
 
 /// Everything the brief used to show, for checking the working. Keeper rows are per vault.
-fn technical(b: &mut String, store: &Store, since: i64, now: i64, primary: &str, vaults: &[VaultDay], fid: &registry::Fidelity) -> Result<()> {
+fn technical(
+    b: &mut String,
+    store: &Store,
+    since: i64,
+    now: i64,
+    primary: &str,
+    vaults: &[VaultDay],
+    fid: &registry::Fidelity,
+) -> Result<()> {
     writeln!(b, "\nMARKET (last 24 h)")?;
     let coin = store.prices("coinbase", since - 3600, now)?;
     match (coin.first(), coin.last()) {

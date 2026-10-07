@@ -561,8 +561,15 @@ mod tests {
         for t in ["market_ticks", "width_evals", "keeper_decisions", "position_snapshots", "position_events", "keeper_runs"] {
             let line = std::fs::read_to_string(format!("tests/fixtures/v6/{t}.json")).unwrap();
             let mut gz = GzEncoder::new(Vec::new(), Compression::default());
-            gz.write_all(format!("{}
-", line.trim()).as_bytes()).unwrap();
+            gz.write_all(
+                format!(
+                    "{}
+",
+                    line.trim()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
             let bytes = gz.finish().unwrap();
             let rows = parse_jsonl_gz(&bytes).unwrap();
             let obj = format!("upgradeable-vault/{PRIMARY_DEFAULT}/v1/{t}/obj");
