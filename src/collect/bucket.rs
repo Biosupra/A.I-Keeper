@@ -32,6 +32,52 @@ use std::io::Read;
 
 pub const TABLES: &[&str] = &["market_ticks", "width_evals", "keeper_decisions", "position_events", "position_snapshots", "keeper_runs"];
 
+/// The original vault's key in every vault column (its keeper writes the bucket's root `v1/`).
+pub const OLD: &str = "old";
+/// The vault the A.I follows unless AIK_PRIMARY_VAULT says otherwise: the multi-vault platform's WETH/USDC
+/// vault, live since 2026-10-04 (the original vault has been withdraw-only since then).
+pub const PRIMARY_DEFAULT: &str = "0x61986afae9b07314d855e7c54949e30a866c93a8";
+/// Where the multi-vault platform's keepers write: one folder per vault, `upgradeable-vault/0x<vault>/v1/...`
+/// (the keeper's `HISTORY_GCS_PREFIX` plus the vault address; schema 6 in the keeper's history.rs).
+pub const NEW_ROOT: &str = "upgradeable-vault/";
+
+/// One keeper's history in the bucket: the vault it manages and the folder its files are under.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Source {
+    /// "old", or the vault's lower-case address.
+    pub vault: String,
+    /// Prepended to `v1/<table>/...`: "" for the original vault, `upgradeable-vault/0x.../` for a new one.
+    pub prefix: String,
+}
+
+impl Source {
+    pub fn old() -> Source {
+        Source { vault: OLD.into(), prefix: String::new() }
+    }
+    pub fn new_vault(address: &str) -> Source {
+        let a = address.to_lowercase();
+        Source { prefix: format!("{NEW_ROOT}{a}/"), vault: a }
+    }
+}
+
+/// The vault of a folder name under `upgradeable-vault/` ("upgradeable-vault/0xabc.../"), if it is one.
+fn vault_of_folder(folder: &str) -> Option<String> {
+    let a = folder.strip_prefix(NEW_ROOT)?.trim_end_matches('/').to_lowercase();
+    (a.len() == 42 && a.starts_with("0x") && a[2..].chars().all(|c| c.is_ascii_hexdigit())).then_some(a)
+}
+
+/// Every keeper in the bucket: the original vault's, then one per vault folder under `upgradeable-vault/`
+/// (a vault the platform adds is picked up on the next sync, with nothing to configure).
+pub async fn sources(bucket: &Bucket<'_>) -> Result<Vec<Source>> {
+    let mut out = vec![Source::old()];
+    for folder in bucket.list_folders(NEW_ROOT).await? {
+        if let Some(v) = vault_of_folder(&folder) {
+            out.push(Source::new_vault(&v));
+        }
+    }
+    Ok(out)
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Mode {
     /// Live: the free-tier plan described above.
@@ -91,6 +137,36 @@ impl<'a> Bucket<'a> {
         Ok(names)
     }
 
+    /// The "folders" directly under a prefix (object-name prefixes up to the next `/`), e.g. each vault's
+    /// folder under `upgradeable-vault/`. One list call per page; objects themselves are not listed.
+    pub async fn list_folders(&self, prefix: &str) -> Result<Vec<String>> {
+        let token = self.token().await?;
+        let auth = format!("Bearer {token}");
+        let mut out = Vec::new();
+        let mut page: Option<String> = None;
+        loop {
+            let mut url = format!(
+                "https://storage.googleapis.com/storage/v1/b/{}/o?prefix={}&delimiter=%2F&fields=prefixes,nextPageToken&maxResults=1000",
+                self.name,
+                urlencoding::encode(prefix)
+            );
+            if let Some(p) = &page {
+                url.push_str(&format!("&pageToken={}", urlencoding::encode(p)));
+            }
+            let v = self.web.get_json(&url, &[("Authorization", &auth)]).await?;
+            for p in v["prefixes"].as_array().into_iter().flatten() {
+                if let Some(n) = p.as_str() {
+                    out.push(n.to_string());
+                }
+            }
+            match v["nextPageToken"].as_str() {
+                Some(p) => page = Some(p.to_string()),
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
     pub async fn read(&self, name: &str) -> Result<Vec<u8>> {
         let token = self.token().await?;
         let url = format!("https://storage.googleapis.com/storage/v1/b/{}/o/{}?alt=media", self.name, urlencoding::encode(name));
@@ -128,9 +204,18 @@ fn s(v: &Value) -> Option<String> {
     }
 }
 
-/// Archives one object byte for byte and decodes its rows into the compact per-minute tables.
-/// Returns the number of compact rows written.
-pub fn archive(store: &Store, table: &str, obj: &str, gz: &[u8], rows: &[Value]) -> Result<usize> {
+/// Archives one object byte for byte and decodes its rows into the compact per-minute tables, tagged
+/// with the vault whose keeper wrote it. Returns the number of compact rows written.
+///
+/// The multi-vault keepers (schema 6) name the vault's two tokens A and B instead of WETH and USDC
+/// (`a_usd` for `weth_usd`, `paid_b_cumulative` for `paid_usdc_cumulative`); in the WETH/USDC vault they
+/// are the same quantities, so each is read under either name. Their lineage reward total is
+/// `earned_aero_cumulative` (paid out OR compounded), which is not the old `paid_aero_cumulative`, so
+/// `paid_aero_cum` stays empty for them rather than holding a different quantity.
+pub fn archive(store: &Store, vault: &str, table: &str, obj: &str, gz: &[u8], rows: &[Value]) -> Result<usize> {
+    if vault != OLD {
+        return archive_v(store, vault, table, obj, gz, rows);
+    }
     let tx = store.db.unchecked_transaction()?;
     let ts0 = rows.first().and_then(|r| i(&r["ts"])).unwrap_or(0);
     tx.execute(
@@ -193,15 +278,80 @@ pub fn archive(store: &Store, table: &str, obj: &str, gz: &[u8], rows: &[Value])
     Ok(n)
 }
 
-/// Stores rows of one object; returns how many were new.
-pub fn store_rows(store: &Store, table: &str, obj: &str, rows: &[Value]) -> Result<usize> {
+/// `archive` for a multi-vault keeper: the same decoding, into the vault-keyed tables.
+fn archive_v(store: &Store, vault: &str, table: &str, obj: &str, gz: &[u8], rows: &[Value]) -> Result<usize> {
+    let tx = store.db.unchecked_transaction()?;
+    let ts0 = rows.first().and_then(|r| i(&r["ts"])).unwrap_or(0);
+    tx.execute(
+        "INSERT OR IGNORE INTO bucket_archive (obj, tbl, ts, bytes, gz) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![obj, table, ts0, gz.len() as i64, gz],
+    )?;
+    let usd_a = |r: &Value| f(&r["a_usd"]).or(f(&r["weth_usd"]));
+    let mut n = 0;
+    for r in rows {
+        let Some(ts) = i(&r["ts"]) else { continue };
+        n += match table {
+            "position_snapshots" => tx.execute(
+                "INSERT OR REPLACE INTO position_min (token_id, ts, origin_token_id, position_usd, hodl_usd, value_minus_hodl_usd,
+                   value_plus_returns_minus_hodl_usd, earned_aero_user, paid_aero_cum, paid_usdc_cum, returned_usd, in_range, tick_lower,
+                   tick_upper, half_spacings, decision, reason, outside_secs, hold_secs, recut_wait, width_best_hs, width_best_net,
+                   width_current_net, liquidity, vault)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+                params![
+                    i(&r["token_id"]), ts, i(&r["origin_token_id"]), f(&r["position_usd"]), f(&r["hodl_usd"]),
+                    f(&r["value_minus_hodl_usd"]), f(&r["value_plus_returns_minus_hodl_usd"]), f(&r["earned_aero_user"]),
+                    f(&r["paid_aero_cumulative"]), f(&r["paid_b_cumulative"]).or(f(&r["paid_usdc_cumulative"])), f(&r["returned_to_owner_usd"]),
+                    r["in_range"].as_bool().map(i64::from), i(&r["tick_lower"]), i(&r["tick_upper"]), i(&r["half_spacings"]),
+                    s(&r["decision"]), s(&r["reason"]), i(&r["outside_secs"]), i(&r["hold_secs"]), s(&r["recut_wait"]),
+                    i(&r["width_best_hs"]), f(&r["width_best_net_per_day"]), f(&r["width_current_net_per_day"]), s(&r["liquidity"]), vault
+                ],
+            )?,
+            "keeper_decisions" => tx.execute(
+                "INSERT OR REPLACE INTO decision_min (token_id, ts, decision, reason, outside_secs, hold_secs, recut_wait, recut_candidate,
+                   half_spacings, width_best_hs, position_usd, spot_tick, twap_tick, fee_pips, tick_lower, tick_upper, vault)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                params![
+                    i(&r["token_id"]), ts, s(&r["decision"]), s(&r["reason"]), i(&r["outside_secs"]), i(&r["hold_secs"]),
+                    s(&r["recut_wait"]), i(&r["recut_candidate"]), i(&r["half_spacings"]), i(&r["width_best_hs"]),
+                    f(&r["position_usd"]), i(&r["spot_tick"]), f(&r["twap_tick"]), i(&r["fee_pips"]), i(&r["tick_lower"]), i(&r["tick_upper"]), vault
+                ],
+            )?,
+            "width_evals" => tx.execute(
+                "INSERT OR REPLACE INTO width_min_v (vault, ts, choice, vol, vol_short, vol_long, rate_per_l, gas_usd, a_usd, current_tick, coverage_secs, table_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    vault, ts, i(&r["choice"]), f(&r["realised_vol_hourly"]), f(&r["realised_vol_hourly_short"]), f(&r["realised_vol_hourly_long"]),
+                    f(&r["rate_per_l"]), f(&r["gas_usd"]), usd_a(r), i(&r["current_tick"]), i(&r["coverage_secs"]),
+                    r.get("table").map(|t| t.to_string())
+                ],
+            )?,
+            "market_ticks" => tx.execute(
+                "INSERT OR REPLACE INTO keeper_market_min_v (vault, ts, tick, twap_tick, fee_pips, a_usd, aero_usd, gas_usd, rate_per_l, avg_rate_per_l,
+                   vol, vol_short, vol_long, staked_liquidity, reward_rate, tracked_positions)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                params![
+                    vault, ts, i(&r["tick"]), f(&r["twap_tick"]), i(&r["fee_pips"]), usd_a(r), f(&r["aero_usd"]), f(&r["gas_usd"]),
+                    f(&r["rate_per_l"]), f(&r["avg_rate_per_l"]), f(&r["realised_vol_hourly_blended"]).or(f(&r["realised_vol_hourly"])),
+                    f(&r["realised_vol_hourly_short"]), f(&r["realised_vol_hourly_long"]), s(&r["staked_liquidity"]),
+                    f(&r["reward_rate_aero_per_s"]), i(&r["tracked_positions"])
+                ],
+            )?,
+            _ => 0,
+        };
+    }
+    tx.commit()?;
+    Ok(n)
+}
+
+/// Stores rows of one object, tagged with the vault whose keeper wrote it; returns how many were new.
+pub fn store_rows(store: &Store, vault: &str, table: &str, obj: &str, rows: &[Value]) -> Result<usize> {
     let tx = store.db.unchecked_transaction()?;
     let mut n = 0;
     for (i, r) in rows.iter().enumerate() {
         let ts = r["ts"].as_i64().or_else(|| r["ts"].as_f64().map(|f| f as i64)).unwrap_or(0);
         n += tx.execute(
-            "INSERT OR IGNORE INTO keeper_rows (obj, line, tbl, ts, json) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![obj, i as i64, table, ts, r.to_string()],
+            "INSERT OR IGNORE INTO keeper_rows (obj, line, tbl, ts, json, vault) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![obj, i as i64, table, ts, r.to_string(), vault],
         )?;
     }
     tx.execute("INSERT OR REPLACE INTO ingested (obj, ts, rows) VALUES (?1, strftime('%s','now'), ?2)", params![obj, rows.len() as i64])?;
@@ -234,13 +384,24 @@ pub fn select(table: &str, names: &[String], mode: Mode) -> Vec<String> {
     by_slot.into_values().map(|(_, n)| n).collect()
 }
 
-/// Syncs the given days (YYYY-MM-DD) of every table: every file is archived and decoded (once),
-/// and the files `select` picks also go to `keeper_rows`. Returns (objects read, rows stored).
-pub async fn sync_days(bucket: &Bucket<'_>, store: &Store, days: &[String], mode: Mode) -> Result<(usize, usize)> {
+/// Syncs the given days (YYYY-MM-DD) of every table of every keeper in `sources`: every file is
+/// archived and decoded (once), and the files `select` picks also go to `keeper_rows`, each tagged
+/// with its vault. Returns (objects read, rows stored).
+pub async fn sync_days(bucket: &Bucket<'_>, store: &Store, sources: &[Source], days: &[String], mode: Mode) -> Result<(usize, usize)> {
+    let (mut objs, mut rows) = (0, 0);
+    for src in sources {
+        let (o, r) = sync_source(bucket, store, src, days, mode).await?;
+        objs += o;
+        rows += r;
+    }
+    Ok((objs, rows))
+}
+
+async fn sync_source(bucket: &Bucket<'_>, store: &Store, src: &Source, days: &[String], mode: Mode) -> Result<(usize, usize)> {
     let (mut objs, mut rows) = (0, 0);
     for table in TABLES {
         for day in days {
-            let prefix = format!("v1/{table}/dt={day}/");
+            let prefix = format!("{}v1/{table}/dt={day}/", src.prefix);
             let names = match bucket.list(&prefix).await {
                 Ok(n) => n,
                 Err(e) => {
@@ -274,11 +435,11 @@ pub async fn sync_days(bucket: &Bucket<'_>, store: &Store, days: &[String], mode
                     }
                 };
                 if !archived {
-                    rows += archive(store, table, name, &bytes, &parsed)?;
+                    rows += archive(store, &src.vault, table, name, &bytes, &parsed)?;
                     objs += 1;
                 }
                 if wants_rows {
-                    rows += store_rows(store, table, name, &parsed)?;
+                    rows += store_rows(store, &src.vault, table, name, &parsed)?;
                 }
             }
         }
@@ -340,8 +501,8 @@ mod tests {
             let rows = parse_jsonl_gz(&gz.finish().unwrap()).unwrap();
             assert_eq!(rows.len(), 2, "{t}");
             assert!(rows[0]["ts"].as_i64().unwrap() > 1_790_000_000, "{t}");
-            assert_eq!(store_rows(&s, t, &format!("obj-{t}"), &rows).unwrap(), 2);
-            assert_eq!(store_rows(&s, t, &format!("obj-{t}"), &rows).unwrap(), 0, "re-ingest is a no-op");
+            assert_eq!(store_rows(&s, OLD, t, &format!("obj-{t}"), &rows).unwrap(), 2);
+            assert_eq!(store_rows(&s, OLD, t, &format!("obj-{t}"), &rows).unwrap(), 0, "re-ingest is a no-op");
         }
         let tick: f64 =
             s.db.query_row("SELECT json_extract(json, '$.tick') FROM keeper_rows WHERE tbl = 'market_ticks'", [], |r| r.get(0)).unwrap();
@@ -357,7 +518,7 @@ mod tests {
             gz.write_all(format!("{}\n", line.trim()).as_bytes()).unwrap();
             let bytes = gz.finish().unwrap();
             let rows = parse_jsonl_gz(&bytes).unwrap();
-            let n = archive(&s, t, &format!("v1/{t}/obj"), &bytes, &rows).unwrap();
+            let n = archive(&s, OLD, t, &format!("v1/{t}/obj"), &bytes, &rows).unwrap();
             assert_eq!(n, if t == "position_events" { 0 } else { 1 }, "{t}");
             let back: Vec<u8> =
                 s.db.query_row("SELECT gz FROM bucket_archive WHERE obj = ?1", [format!("v1/{t}/obj")], |r| r.get(0)).unwrap();
@@ -388,5 +549,34 @@ mod tests {
     fn day_list() {
         let d = days_between("2026-09-27", 1_790_679_863); // 2026-09-29
         assert_eq!(d, vec!["2026-09-27", "2026-09-28", "2026-09-29"]);
+    }
+
+    #[test]
+    fn new_vault_rows_are_tagged_with_their_vault() {
+        assert_eq!(vault_of_folder("upgradeable-vault/0x61986AFAE9B07314D855E7C54949E30A866C93A8/").as_deref(), Some(PRIMARY_DEFAULT));
+        assert_eq!(vault_of_folder("upgradeable-vault/not-a-vault/"), None);
+        assert_eq!(Source::new_vault(PRIMARY_DEFAULT).prefix, format!("upgradeable-vault/{PRIMARY_DEFAULT}/"));
+        // Real schema-6 rows from the new vault's keeper (0.11.0).
+        let s = Store::memory().unwrap();
+        for t in ["market_ticks", "width_evals", "keeper_decisions", "position_snapshots", "position_events", "keeper_runs"] {
+            let line = std::fs::read_to_string(format!("tests/fixtures/v6/{t}.json")).unwrap();
+            let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+            gz.write_all(format!("{}
+", line.trim()).as_bytes()).unwrap();
+            let bytes = gz.finish().unwrap();
+            let rows = parse_jsonl_gz(&bytes).unwrap();
+            let obj = format!("upgradeable-vault/{PRIMARY_DEFAULT}/v1/{t}/obj");
+            archive(&s, PRIMARY_DEFAULT, t, &obj, &bytes, &rows).unwrap();
+            assert_eq!(store_rows(&s, PRIMARY_DEFAULT, t, &obj, &rows).unwrap(), 1, "{t}");
+        }
+        let n = |q: &str| -> i64 { s.db.query_row(q, [PRIMARY_DEFAULT], |r| r.get(0)).unwrap() };
+        assert_eq!(n("SELECT COUNT(*) FROM keeper_rows WHERE vault = ?1"), 6);
+        assert_eq!(n("SELECT COUNT(*) FROM keeper_rows WHERE vault != ?1"), 0, "nothing lands under the original vault");
+        assert_eq!(n("SELECT COUNT(*) FROM position_min WHERE vault = ?1 AND token_id IS NOT NULL AND position_usd > 0"), 1);
+        assert_eq!(n("SELECT COUNT(*) FROM decision_min WHERE vault = ?1"), 1);
+        assert_eq!(n("SELECT COUNT(*) FROM width_min_v WHERE vault = ?1 AND choice = 11"), 1);
+        // Schema 6 names the price a_usd, not weth_usd.
+        let a: f64 = s.db.query_row("SELECT a_usd FROM keeper_market_min_v WHERE vault = ?1", [PRIMARY_DEFAULT], |r| r.get(0)).unwrap();
+        assert!((a - 2698.36).abs() < 0.01, "{a}");
     }
 }

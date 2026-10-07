@@ -186,7 +186,10 @@ pub struct DaySummary {
 
 /// Replays every complete UTC day in [from, to] not replayed yet: every fixed width, and every
 /// model's own width choices (from its hourly 24 h forecasts), under the keeper's current rules.
-pub fn days(store: &Store, from: i64, to: i64, now: i64) -> Result<DaySummary> {
+///
+/// `vault`: whose keeper's current policy the replay applies (the live keeper's). The width tables it reads
+/// for volatility, gas and size come from every vault's keeper: all run the same pool with the same engine.
+pub fn days(store: &Store, from: i64, to: i64, now: i64, vault: &str) -> Result<DaySummary> {
     // Real keeper width tables (since the vault launched) give the emission rate, gas and size.
     // Only each table's time and volatility are read for all of them (the server holds one a
     // minute; parsing them all nightly would cost tens of MB); the full table only for the template.
@@ -243,7 +246,7 @@ pub fn days(store: &Store, from: i64, to: i64, now: i64) -> Result<DaySummary> {
         r.filter_map(|x| x.ok()).collect()
     };
     let fee = median(fees).unwrap_or(500.0);
-    let policy = registry::policy_at(store, now)?;
+    let policy = registry::policy_at(store, now, vault)?;
 
     // Every model's hourly 24 h forecast (replayed or live), by (model, hour).
     let preds: HashMap<(String, i64), f64> = {
@@ -339,7 +342,7 @@ pub const VERSION: &str = "1";
 /// Both replays over the last `days_back` days (each hour and day only once), or over all history
 /// when the replay's VERSION changed. The day replay needs a keeper width table; without the keeper
 /// bucket it is skipped and says so.
-pub fn run(store: &Store, now: i64, days_back: i64) -> Result<String> {
+pub fn run(store: &Store, now: i64, days_back: i64, vault: &str) -> Result<String> {
     let first: Option<i64> = store.db.query_row("SELECT MIN(ts) FROM price_1m WHERE source = 'coinbase'", [], |r| r.get(0))?;
     let Some(first) = first else { bail!("no Coinbase history yet (run `aikeeper backfill` first)") };
     let mut days_back = days_back;
@@ -357,7 +360,7 @@ pub fn run(store: &Store, now: i64, days_back: i64) -> Result<String> {
     let from = (now - days_back * 86_400).max(first + 30 * 86_400);
     let f = forecasts(store, from, now, now)?;
     out += &format!("forecasts: {} hours replayed, {} graded forecasts", f.hours, f.rows);
-    match days(store, from, now, now) {
+    match days(store, from, now, now, vault) {
         Ok(d) => out += &format!("; days: {} replayed ({} strategy rows)", d.days, d.rows),
         Err(e) => out += &format!("; days: skipped ({e:#})"),
     }
@@ -513,18 +516,18 @@ mod tests {
     fn a_new_replay_version_rebuilds_everything() {
         let (s, start) = store_with_prices(45, 0.005);
         let now = start + 45 * 86_400;
-        let first = run(&s, now, 3).unwrap();
+        let first = run(&s, now, 3, crate::collect::bucket::OLD).unwrap();
         assert!(first.contains("replaying all history"), "a fresh database replays everything: {first}");
         let count = |s: &Store| -> i64 { s.db.query_row("SELECT COUNT(*) FROM predictions WHERE replay = 1", [], |r| r.get(0)).unwrap() };
         let n = count(&s);
         assert!(n > 13 * 24 * 6, "{n}");
         // The same version: nothing new.
-        assert!(run(&s, now, 3).unwrap().starts_with("forecasts: 0 hours"));
+        assert!(run(&s, now, 3, crate::collect::bucket::OLD).unwrap().starts_with("forecasts: 0 hours"));
         // A stale row from an older replay logic, then a version change: all rebuilt, stale row gone.
         s.db.execute("UPDATE predictions SET value = -1 WHERE replay = 1 AND id = (SELECT MIN(id) FROM predictions WHERE replay = 1)", [])
             .unwrap();
         s.meta_set("replay_version", "0").unwrap();
-        let again = run(&s, now, 3).unwrap();
+        let again = run(&s, now, 3, crate::collect::bucket::OLD).unwrap();
         assert!(again.contains(&format!("{n} older replayed forecasts cleared")), "{again}");
         assert_eq!(count(&s), n);
         let stale: i64 = s.db.query_row("SELECT COUNT(*) FROM predictions WHERE value = -1", [], |r| r.get(0)).unwrap();
@@ -536,7 +539,7 @@ mod tests {
         )
         .unwrap();
         s.meta_set("replay_version", "0").unwrap();
-        run(&s, now, 3).unwrap();
+        run(&s, now, 3, crate::collect::bucket::OLD).unwrap();
         let live: i64 = s.db.query_row("SELECT COUNT(*) FROM predictions WHERE replay IS NULL", [], |r| r.get(0)).unwrap();
         assert_eq!(live, 1);
     }
@@ -644,7 +647,7 @@ mod tests {
         )
         .unwrap();
         forecasts(&s, start + 35 * 86_400, start + 44 * 86_400, now).unwrap();
-        let sum = days(&s, start + 38 * 86_400, start + 43 * 86_400, now).unwrap();
+        let sum = days(&s, start + 38 * 86_400, start + 43 * 86_400, now, crate::collect::bucket::OLD).unwrap();
         assert!(sum.days >= 4, "{sum:?}");
         let fixed: i64 =
             s.db.query_row("SELECT COUNT(DISTINCT strategy) FROM replay_day WHERE strategy LIKE 'fixed:%'", [], |r| r.get(0)).unwrap();
@@ -653,7 +656,7 @@ mod tests {
             s.db.query_row("SELECT COUNT(DISTINCT strategy) FROM replay_day WHERE strategy NOT LIKE 'fixed:%'", [], |r| r.get(0)).unwrap();
         assert!(models >= 4, "{models}");
         // Idempotent.
-        assert_eq!(days(&s, start + 38 * 86_400, start + 43 * 86_400, now).unwrap().days, 0);
+        assert_eq!(days(&s, start + 38 * 86_400, start + 43 * 86_400, now, crate::collect::bucket::OLD).unwrap().days, 0);
         let a: String = s.db.query_row("SELECT assumptions FROM replay_runs", [], |r| r.get(0)).unwrap();
         let a: serde_json::Value = serde_json::from_str(&a).unwrap();
         assert!(a["pool_fee_pips"].as_f64().is_some() && a["vol_basis_pool_over_coinbase"].as_f64().is_some(), "{a}");

@@ -46,6 +46,10 @@ pub struct Config {
     pub disk_budget_gb: f64,
     /// First block of pool/gauge history the backfill reads (the vault's deploy block).
     pub chain_start_block: i64,
+    /// The vault whose keeper the A.I follows (shadow mode, the rules check, the rule-drift alert): the live
+    /// one, lower-case address, or "old" for the original vault. Default: the WETH/USDC vault of the
+    /// multi-vault platform, live since 2026-10-04 (the original vault is withdraw-only since then).
+    pub primary_vault: String,
 }
 
 impl Config {
@@ -88,6 +92,9 @@ impl Config {
             predict_every_secs: num("AIK_PREDICT_EVERY_SECS", 3600),
             disk_budget_gb: num("AIK_DISK_BUDGET_GB", 20.0),
             chain_start_block: num("AIK_CHAIN_START_BLOCK", 51_189_251),
+            primary_vault: var("AIK_PRIMARY_VAULT")
+                .unwrap_or_else(|| crate::collect::bucket::PRIMARY_DEFAULT.into())
+                .to_lowercase(),
         }
     }
 

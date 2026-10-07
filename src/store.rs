@@ -111,6 +111,21 @@ CREATE TABLE IF NOT EXISTS keeper_market_min (
   reward_rate REAL, tracked_positions INTEGER
 );
 
+-- The same two per-minute tables for the vaults of the multi-vault platform (2026-10-07), keyed by vault and
+-- time: every vault's keeper writes a row a minute, so time alone would let one vault overwrite another. The
+-- original vault keeps the two tables above. Token A is WETH in the WETH/USDC vault (a_usd = its price).
+CREATE TABLE IF NOT EXISTS width_min_v (
+  vault TEXT NOT NULL, ts INTEGER NOT NULL, choice INTEGER, vol REAL, vol_short REAL, vol_long REAL, rate_per_l REAL, gas_usd REAL,
+  a_usd REAL, current_tick INTEGER, coverage_secs INTEGER, table_json TEXT,
+  PRIMARY KEY (vault, ts)
+);
+CREATE TABLE IF NOT EXISTS keeper_market_min_v (
+  vault TEXT NOT NULL, ts INTEGER NOT NULL, tick INTEGER, twap_tick REAL, fee_pips INTEGER, a_usd REAL, aero_usd REAL, gas_usd REAL,
+  rate_per_l REAL, avg_rate_per_l REAL, vol REAL, vol_short REAL, vol_long REAL, staked_liquidity TEXT,
+  reward_rate REAL, tracked_positions INTEGER,
+  PRIMARY KEY (vault, ts)
+);
+
 -- Every log the Panda pool and its gauge emit, byte for byte (one gzipped JSON array per block range).
 CREATE TABLE IF NOT EXISTS chain_log_archive (
   from_block INTEGER PRIMARY KEY, to_block INTEGER NOT NULL, logs INTEGER NOT NULL, gz BLOB NOT NULL
@@ -205,18 +220,32 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     // previous 24 h of Coinbase volatility) and whether it was replayed (1) or made live (NULL).
     ("predictions", "regime", "TEXT"),
     ("predictions", "replay", "INTEGER"),
+    // Multi-vault (2026-10-07): which vault's keeper a row came from. 'old' is the original vault (the bucket's
+    // root `v1/`); a new vault is its lower-case address (its folder `upgradeable-vault/0x.../v1/`). Rows stored
+    // before this change all came from the original vault, hence the default.
+    ("keeper_rows", "vault", "TEXT NOT NULL DEFAULT 'old'"),
+    ("position_min", "vault", "TEXT NOT NULL DEFAULT 'old'"),
+    ("decision_min", "vault", "TEXT NOT NULL DEFAULT 'old'"),
+    ("shadow", "vault", "TEXT NOT NULL DEFAULT 'old'"),
 ];
 
 pub fn migrate(db: &Connection) -> Result<()> {
     for (table, column, ty) in MIGRATIONS {
         let mut st = db.prepare(&format!("PRAGMA table_info({table})"))?;
         let have: Vec<String> = st.query_map([], |r| r.get::<_, String>(1))?.collect::<std::result::Result<_, _>>()?;
-        if !have.iter().any(|c| c == column) {
+        // A table this database does not have yet is created whole by the schema, column included.
+        if !have.is_empty() && !have.iter().any(|c| c == column) {
             db.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ty}"))?;
         }
     }
     // Indexes on migrated columns (the columns must exist first).
     db.execute_batch("CREATE INDEX IF NOT EXISTS predictions_regime ON predictions (kind, regime, made_ts)")?;
+    for (name, table, cols) in [("keeper_rows_vault", "keeper_rows", "vault, tbl, ts"), ("position_min_vault", "position_min", "vault, ts")] {
+        let exists: i64 = db.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1", [table], |r| r.get(0))?;
+        if exists > 0 {
+            db.execute_batch(&format!("CREATE INDEX IF NOT EXISTS {name} ON {table} ({cols})"))?;
+        }
+    }
     Ok(())
 }
 

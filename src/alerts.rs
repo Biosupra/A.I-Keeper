@@ -7,14 +7,16 @@
 //! What is watched (all read-only):
 //! * the live keeper's heartbeat: its signed deposit-width feed on the website (posted every
 //!   5 minutes) older than 30 minutes means the keeper process has stopped;
-//! * the keeper wallet's ETH on Base, which pays every rebalance's gas;
+//! * each keeper wallet's ETH on Base, which pays every rebalance's gas: the original vault's keeper
+//!   and the keeper of every vault of the multi-vault platform (read from the vault's `keeperBot()`);
 //! * the website: the home page and the Worker's health route failing twice in a row;
-//! * the keeper's own history: no new rows for 3 hours while the A.I is reading the bucket fine;
+//! * each keeper's own history, per vault: no new rows for 3 hours while the A.I is reading the
+//!   bucket fine;
 //! * the keeper's decisions: a runaway-guard skip, or a position left out of range past the crash
 //!   valve's 24-hour cap;
 //! * the A.I itself: its Base reads, its pool-event feed, its liquidity map, its market data or its
 //!   bucket access stalling, and its database approaching the disk budget;
-//! * rule drift: the keeper choosing a width the A.I's copy of its rules would not (its rules have
+//! * rule drift (the live vault's keeper, AIK_PRIMARY_VAULT): the keeper choosing a width the A.I's copy of its rules would not (its rules have
 //!   changed and the shadow replay needs updating).
 
 use crate::config::Config;
@@ -24,7 +26,29 @@ use anyhow::Result;
 use rusqlite::params;
 use serde_json::{json, Value};
 
+/// The original vault's keeper wallet. Each newer vault's keeper is read from the vault itself
+/// (`keeperBot()`, which asks the platform registry), so a vault the platform adds is watched too.
 pub const KEEPER_WALLET: &str = "0x940e46DBB87218C1dD9EeecF33DD9C36b0A6e8a8";
+/// PandaVault.keeperBot() (verified 2026-10-07: the WETH/USDC vault answers 0x5fb0...af60).
+const SEL_KEEPER_BOT: &str = "0x12f3d4a2";
+
+/// How a vault is named in alerts and the brief.
+pub fn vault_name(vault: &str) -> String {
+    if vault == crate::collect::bucket::OLD {
+        "the original vault".into()
+    } else if vault.len() == 42 {
+        format!("the new vault ({}…{})", &vault[..6], &vault[38..])
+    } else {
+        format!("vault {vault}")
+    }
+}
+
+/// The vaults of the multi-vault platform the A.I has keeper history for.
+pub fn new_vaults(store: &Store) -> Result<Vec<String>> {
+    let mut st = store.db.prepare("SELECT DISTINCT vault FROM keeper_rows WHERE tbl = 'keeper_runs' AND vault != 'old' ORDER BY vault")?;
+    let r = st.query_map([], |r| r.get(0))?;
+    Ok(r.filter_map(|x| x.ok()).collect())
+}
 /// Below this the keeper may soon be unable to pay for a rebalance (~$0.03 each at 2026 gas).
 pub const KEEPER_MIN_ETH: f64 = 0.001;
 const RESEND_SECS: i64 = 6 * 3600;
@@ -59,18 +83,31 @@ pub async fn evaluate(cfg: &Config, store: &Store, web: &Web, rpc: &Rpc, now: i6
         Err(e) => tracing::warn!("alerts: width feed: {e:#}"),
     }
 
-    // Keeper gas wallet.
-    match rpc.call("eth_getBalance", json!([KEEPER_WALLET, "latest"])).await {
-        Ok(v) => {
-            let wei = v.as_str().and_then(|s| u128::from_str_radix(s.trim_start_matches("0x"), 16).ok()).unwrap_or(u128::MAX);
-            let eth = wei as f64 / 1e18;
-            if eth < KEEPER_MIN_ETH {
-                out.push(f("keeper-gas", format!(
-                    "The keeper wallet ({KEEPER_WALLET}) holds {eth:.5} ETH on Base, below {KEEPER_MIN_ETH} ETH. Rebalances will start failing when it runs out. Top it up."
-                )));
-            }
+    // Keeper gas wallets: the original vault's, and each new vault's keeper as the vault reports it.
+    let mut wallets: Vec<(String, String, String)> = vec![("keeper-gas".into(), crate::collect::bucket::OLD.into(), KEEPER_WALLET.into())];
+    for v in new_vaults(store)? {
+        match rpc.call("eth_call", json!([{ "to": v, "data": SEL_KEEPER_BOT }, "latest"])).await {
+            Ok(r) => match r.as_str().filter(|s| s.len() >= 66) {
+                Some(word) => wallets.push((format!("keeper-gas:{v}"), v.clone(), format!("0x{}", &word[word.len() - 40..]))),
+                None => tracing::warn!("alerts: keeperBot() of {v} answered {r}"),
+            },
+            Err(e) => tracing::warn!("alerts: keeperBot() of {v}: {e:#}"),
         }
-        Err(e) => tracing::warn!("alerts: keeper balance: {e:#}"),
+    }
+    for (key, vault, wallet) in &wallets {
+        match rpc.call("eth_getBalance", json!([wallet, "latest"])).await {
+            Ok(v) => {
+                let wei = v.as_str().and_then(|s| u128::from_str_radix(s.trim_start_matches("0x"), 16).ok()).unwrap_or(u128::MAX);
+                let eth = wei as f64 / 1e18;
+                if eth < KEEPER_MIN_ETH {
+                    out.push(f(key, format!(
+                        "The keeper of {} ({wallet}) holds {eth:.5} ETH on Base, below {KEEPER_MIN_ETH} ETH. Its rebalances will start failing when it runs out. Top it up.",
+                        vault_name(vault)
+                    )));
+                }
+            }
+            Err(e) => tracing::warn!("alerts: keeper balance {wallet}: {e:#}"),
+        }
     }
 
     // Website: two consecutive failures of the same URL.
@@ -92,14 +129,8 @@ pub async fn evaluate(cfg: &Config, store: &Store, web: &Web, rpc: &Rpc, now: i6
         }
     }
 
-    // The keeper's own history, the A.I's own feeds. The keeper writes every minute; the A.I now
-    // reads every file (width_min, decision_min), so the newest of those is the freshest signal.
-    let newest_keeper: Option<i64> = store.db.query_row(
-        "SELECT MAX(t) FROM (SELECT MAX(ts) AS t FROM keeper_rows WHERE tbl IN ('width_evals', 'keeper_decisions')
-                             UNION ALL SELECT MAX(ts) FROM width_min UNION ALL SELECT MAX(ts) FROM decision_min)",
-        [],
-        |r| r.get(0),
-    )?;
+    // The keepers' own history, the A.I's own feeds. Each keeper writes every minute; the A.I reads
+    // every file (the per-minute tables), so the newest of those is the freshest signal, per vault.
     let bucket_ok: i64 = store.meta_get("bucket_ok_ts")?.and_then(|v| v.parse().ok()).unwrap_or(0);
     if cfg.bucket.is_some() {
         if bucket_ok > 0 && now - bucket_ok > 3 * 3600 {
@@ -108,13 +139,35 @@ pub async fn evaluate(cfg: &Config, store: &Store, web: &Web, rpc: &Rpc, now: i6
                 format!("The A.I has not been able to read the keeper's history bucket for {} hours.", (now - bucket_ok) / 3600),
             ));
         }
-        if let Some(n) = newest_keeper {
+        let old = crate::collect::bucket::OLD;
+        let mut vaults = vec![old.to_string()];
+        vaults.extend(new_vaults(store)?);
+        for v in &vaults {
+            let newest: Option<i64> = if v == old {
+                store.db.query_row(
+                    "SELECT MAX(t) FROM (SELECT MAX(ts) AS t FROM keeper_rows WHERE vault = 'old' AND tbl IN ('width_evals', 'keeper_decisions')
+                                         UNION ALL SELECT MAX(ts) FROM width_min UNION ALL SELECT MAX(ts) FROM decision_min WHERE vault = 'old')",
+                    [],
+                    |r| r.get(0),
+                )?
+            } else {
+                store.db.query_row(
+                    "SELECT MAX(t) FROM (SELECT MAX(ts) AS t FROM keeper_rows WHERE vault = ?1 AND tbl IN ('width_evals', 'keeper_decisions')
+                                         UNION ALL SELECT MAX(ts) FROM width_min_v WHERE vault = ?1 UNION ALL SELECT MAX(ts) FROM decision_min WHERE vault = ?1)",
+                    [v],
+                    |r| r.get(0),
+                )?
+            };
             // Only meaningful right after a successful sync: the bucket is read every 30 minutes.
-            if bucket_ok > n && bucket_ok - n > 3 * 3600 {
-                out.push(f("keeper-history", format!(
-                    "The keeper's newest history row is {} hours older than the A.I's last successful read: the keeper has stopped writing its log (it writes every minute).",
-                    (bucket_ok - n) / 3600
-                )));
+            if let Some(n) = newest {
+                if bucket_ok > n && bucket_ok - n > 3 * 3600 {
+                    let key = if v == old { "keeper-history".to_string() } else { format!("keeper-history:{v}") };
+                    out.push(f(&key, format!(
+                        "The keeper of {}: its newest history row is {} hours older than the A.I's last successful read, so it has stopped writing its log (it writes every minute).",
+                        vault_name(v),
+                        (bucket_ok - n) / 3600
+                    )));
+                }
             }
         }
     }
@@ -149,9 +202,9 @@ pub async fn evaluate(cfg: &Config, store: &Store, web: &Web, rpc: &Rpc, now: i6
     // Keeper decisions of the last day (every one, from decision_min, plus the older sampled rows):
     // runaway guard, valve cap exceeded.
     let mut st = store.db.prepare(
-        "SELECT json FROM keeper_rows WHERE tbl = 'keeper_decisions' AND ts > ?1
+        "SELECT json_set(json, '$.vault', vault) FROM keeper_rows WHERE tbl = 'keeper_decisions' AND ts > ?1
          UNION ALL
-         SELECT json_object('token_id', token_id, 'decision', decision, 'reason', reason, 'outside_secs', outside_secs)
+         SELECT json_object('token_id', token_id, 'decision', decision, 'reason', reason, 'outside_secs', outside_secs, 'vault', vault)
            FROM decision_min WHERE ts > ?1",
     )?;
     let decisions: Vec<Value> = st
@@ -159,32 +212,40 @@ pub async fn evaluate(cfg: &Config, store: &Store, web: &Web, rpc: &Rpc, now: i6
         .filter_map(|r| r.ok())
         .filter_map(|s| serde_json::from_str(&s).ok())
         .collect();
+    let in_vault = |d: &Value| vault_name(d["vault"].as_str().unwrap_or(crate::collect::bucket::OLD));
     if let Some(d) =
         decisions.iter().find(|d| d["decision"] == "skipped" && d["reason"].as_str().unwrap_or("").contains("MAX_REBALANCES_PER_DAY"))
     {
         out.push(f(
             "keeper-runaway",
-            format!("The keeper hit its runaway guard: {} (position {}).", d["reason"].as_str().unwrap_or(""), d["token_id"]),
+            format!(
+                "The keeper of {} hit its runaway guard: {} (position {}).",
+                in_vault(d),
+                d["reason"].as_str().unwrap_or(""),
+                d["token_id"]
+            ),
         ));
     }
     if let Some(d) = decisions.iter().find(|d| d["outside_secs"].as_f64().unwrap_or(0.0) > 26.0 * 3600.0) {
         out.push(f(
             "keeper-stuck",
             format!(
-            "Position {} has been out of range for {:.1} hours, past the keeper's 24-hour crash-valve cap. It should have been re-centred.",
-            d["token_id"],
-            d["outside_secs"].as_f64().unwrap_or(0.0) / 3600.0
-        ),
+                "Position {} in {} has been out of range for {:.1} hours, past the keeper's 24-hour crash-valve cap. It should have been re-centred.",
+                d["token_id"],
+                in_vault(d),
+                d["outside_secs"].as_f64().unwrap_or(0.0) / 3600.0
+            ),
         ));
     }
 
-    // Rule drift, checked on the last day's width tables.
-    let mut st = store.db.prepare("SELECT ts, json FROM keeper_rows WHERE tbl = 'width_evals' AND ts > ?1")?;
-    let tables: Vec<(i64, String)> = st.query_map([now - 86_400], |r| Ok((r.get(0)?, r.get(1)?)))?.filter_map(|r| r.ok()).collect();
+    // Rule drift, checked on the last day's width tables of the keeper the A.I follows.
+    let mut st = store.db.prepare("SELECT ts, json FROM keeper_rows WHERE tbl = 'width_evals' AND vault = ?2 AND ts > ?1")?;
+    let tables: Vec<(i64, String)> =
+        st.query_map(params![now - 86_400, cfg.primary_vault], |r| Ok((r.get(0)?, r.get(1)?)))?.filter_map(|r| r.ok()).collect();
     let (mut n, mut ok) = (0, 0);
     for (ts, raw) in &tables {
         let Some(t) = serde_json::from_str::<Value>(raw).ok().and_then(|v| crate::model::shadow::Table::from_keeper(&v)) else { continue };
-        let p = crate::registry::policy_at(store, *ts)?;
+        let p = crate::registry::policy_at(store, *ts, &cfg.primary_vault)?;
         let nets: Vec<(i64, f64)> = t.rows.iter().map(|r| (r.h as i64, r.net)).collect();
         n += 1;
         if crate::model::shadow::choose(&t, &nets, &p) == t.choice {
@@ -193,7 +254,8 @@ pub async fn evaluate(cfg: &Config, store: &Store, web: &Web, rpc: &Rpc, now: i6
     }
     if n >= 6 && ok < n {
         out.push(f("rule-drift", format!(
-            "The keeper chose a width the A.I's copy of its rules would not in {} of {n} tables in the last day. The keeper's rules have changed; the A.I's shadow replay needs updating.",
+            "The keeper of {} chose a width the A.I's copy of its rules would not in {} of {n} tables in the last day. The keeper's rules have changed; the A.I's shadow replay needs updating.",
+            vault_name(&cfg.primary_vault),
             n - ok
         )));
     }

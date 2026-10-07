@@ -78,9 +78,32 @@ fn bucket_job(cfg: &Config, web: &Web, t: i64, daily: bool) -> Result<()> {
                 t
             };
             let days = bucket::days_between(&day(from), t);
-            match bucket::sync_days(&b, &store, &days, bucket::Mode::Lean).await {
+            // Every keeper in the bucket: the original vault's and one per vault of the multi-vault platform
+            // (found by listing their folders, so a new vault needs no configuration).
+            let sources = match bucket::sources(&b).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("bucket: could not list the vault folders, reading the original vault only: {e:#}");
+                    vec![bucket::Source::old()]
+                }
+            };
+            // A vault seen for the first time: its whole history since AIK_BUCKET_START, once.
+            for src in sources.iter().filter(|s| s.vault != bucket::OLD) {
+                let key = format!("bucket_backfilled:{}", src.vault);
+                if store.meta_get(&key)?.is_none() {
+                    let all = bucket::days_between(&cfg.bucket_start, t);
+                    match bucket::sync_days(&b, &store, std::slice::from_ref(src), &all, bucket::Mode::Lean).await {
+                        Ok((o, r)) => {
+                            tracing::info!("bucket: vault {} backfilled ({o} files, {r} rows)", src.vault);
+                            store.meta_set(&key, &now().to_string())?;
+                        }
+                        Err(e) => tracing::warn!("bucket: backfill of vault {}: {e:#}", src.vault),
+                    }
+                }
+            }
+            match bucket::sync_days(&b, &store, &sources, &days, bucket::Mode::Lean).await {
                 Ok((o, r)) => {
-                    tracing::info!("bucket: {o} files, {r} rows");
+                    tracing::info!("bucket: {o} files, {r} rows ({} keepers)", sources.len());
                     // A sync counts as healthy when listing worked (sync_days logs per-table errors).
                     if bucket::readable(&b).await {
                         store.meta_set("bucket_ok_ts", &now().to_string())?;
@@ -91,12 +114,12 @@ fn bucket_job(cfg: &Config, web: &Web, t: i64, daily: bool) -> Result<()> {
         }
         if daily {
             // Yesterday joins the replayed record (and any hour the daemon missed is filled).
-            match crate::replay::run(&store, now(), 3) {
+            match crate::replay::run(&store, now(), 3, &cfg.primary_vault) {
                 Ok(r) => tracing::info!("replay: {r}"),
                 Err(e) => tracing::warn!("replay: {e:#}"),
             }
         }
-        match registry::make_shadow(&store, now()) {
+        match registry::make_shadow(&store, now(), &cfg.primary_vault) {
             Ok(n) if n > 0 => tracing::info!("shadow: {n} new decisions"),
             Ok(_) => {}
             Err(e) => tracing::warn!("shadow: {e:#}"),

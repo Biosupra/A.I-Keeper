@@ -164,13 +164,17 @@ pub fn champion(store: &Store, now: i64) -> Result<String> {
 /// Coinbase read 0.54%, at every sampling interval: a basis gap, not noise). So the A.I applies its
 /// RELATIVE view to the keeper's own number: ai_vol = keeper_vol * (model / keeper-style), both on
 /// Coinbase. With model = keeper-style this is exactly the keeper's volatility.
-pub fn make_shadow(store: &Store, now: i64) -> Result<usize> {
+///
+/// Vaults: decisions are made from ONE keeper's tables, the vault the A.I follows (`vault`, the live one),
+/// so each hour has one decision. All keepers run the same pool with the same width engine, so the
+/// scorecards pool every vault's graded decisions; each is graded with its own vault's tables and policy.
+pub fn make_shadow(store: &Store, now: i64, vault: &str) -> Result<usize> {
     let mut st = store.db.prepare(
-        "SELECT ts, json FROM keeper_rows WHERE tbl = 'width_evals' AND ts > ?1
-           AND ts / 3600 NOT IN (SELECT made_ts / 3600 FROM shadow) ORDER BY ts",
+        "SELECT ts, json FROM keeper_rows WHERE tbl = 'width_evals' AND vault = ?2 AND ts > ?1
+           AND ts / 3600 NOT IN (SELECT made_ts / 3600 FROM shadow WHERE vault = ?2) ORDER BY ts",
     )?;
     let rows: Vec<(i64, String)> =
-        st.query_map([now - 14 * 86_400], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
+        st.query_map(params![now - 14 * 86_400, vault], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
     let mut made = 0;
     let mut last_hour = -1;
     for (ts, raw) in rows {
@@ -186,7 +190,7 @@ pub fn make_shadow(store: &Store, now: i64) -> Result<usize> {
         let ai_vol = table.vol * ratio;
         // Every strategy picks its width with the keeper's own hysteresis rule, under the policy the
         // keeper was running at that moment.
-        let policy = policy_at(store, ts)?;
+        let policy = policy_at(store, ts, vault)?;
         let scores = table.rescore(ai_vol);
         let ai_choice = shadow::choose(&table, &scores, &policy);
         for (m, v) in &f {
@@ -198,9 +202,9 @@ pub fn make_shadow(store: &Store, now: i64) -> Result<usize> {
             )?;
         }
         store.db.execute(
-            "INSERT OR IGNORE INTO shadow (made_ts, start_tick, position_usd, keeper_choice, ai_choice, keeper_vol, ai_vol, ai_model, detail)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![ts, table.tick, table.position_usd, table.choice, ai_choice, table.vol, ai_vol, model, json!({ "ai_scores": scores, "ratio_to_keeper_style": ratio, "forecasts": f, "table": table }).to_string()],
+            "INSERT OR IGNORE INTO shadow (made_ts, start_tick, position_usd, keeper_choice, ai_choice, keeper_vol, ai_vol, ai_model, detail, vault)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![ts, table.tick, table.position_usd, table.choice, ai_choice, table.vol, ai_vol, model, json!({ "ai_scores": scores, "ratio_to_keeper_style": ratio, "forecasts": f, "table": table }).to_string(), vault],
         )?;
         last_hour = ts / 3600;
         made += 1;
@@ -281,11 +285,15 @@ pub fn resolve(store: &Store, now: i64) -> Result<usize> {
     Ok(graded)
 }
 
-/// The keeper's rebalance policy as its most recent start at or before `t` logged it.
-pub fn policy_at(store: &Store, t: i64) -> Result<shadow::Policy> {
+/// A vault's keeper's rebalance policy as its most recent start at or before `t` logged it.
+pub fn policy_at(store: &Store, t: i64, vault: &str) -> Result<shadow::Policy> {
     let raw: Option<String> = store
         .db
-        .query_row("SELECT json FROM keeper_rows WHERE tbl = 'keeper_runs' AND ts <= ?1 ORDER BY ts DESC LIMIT 1", [t], |r| r.get(0))
+        .query_row(
+            "SELECT json FROM keeper_rows WHERE tbl = 'keeper_runs' AND vault = ?2 AND ts <= ?1 ORDER BY ts DESC LIMIT 1",
+            params![t, vault],
+            |r| r.get(0),
+        )
         .ok();
     Ok(match raw.and_then(|r| serde_json::from_str::<Value>(&r).ok()) {
         Some(v) => shadow::Policy::from_keeper_run(&v),
@@ -298,11 +306,15 @@ pub fn policy_at(store: &Store, t: i64) -> Result<shadow::Policy> {
 /// window is not yet covered (prices < 90%, or fewer than 20 hourly tables, or none after hour 23).
 pub fn grade_shadow(store: &Store, made: i64) -> Result<Option<()>> {
     let end = made + 86_400;
+    // The decision is graded with the tables and policy of the vault whose keeper it shadowed.
+    let vault: String = store.db.query_row("SELECT vault FROM shadow WHERE made_ts = ?1", [made], |r| r.get(0))?;
     // Every keeper table stored for the window (one per 10 minutes live), so each action is taken
     // with the table the keeper had at that moment.
     let tables: Vec<shadow::Table> = {
-        let mut st = store.db.prepare("SELECT json FROM keeper_rows WHERE tbl = 'width_evals' AND ts >= ?1 AND ts < ?2 ORDER BY ts")?;
-        let rows = st.query_map([made, end], |r| r.get::<_, String>(0))?;
+        let mut st = store
+            .db
+            .prepare("SELECT json FROM keeper_rows WHERE tbl = 'width_evals' AND vault = ?3 AND ts >= ?1 AND ts < ?2 ORDER BY ts")?;
+        let rows = st.query_map(params![made, end, vault], |r| r.get::<_, String>(0))?;
         let mut v: Vec<shadow::Table> = rows
             .filter_map(|r| r.ok())
             .filter_map(|d| serde_json::from_str::<Value>(&d).ok())
@@ -316,7 +328,7 @@ pub fn grade_shadow(store: &Store, made: i64) -> Result<Option<()>> {
         return Ok(None);
     }
     let path = store.pool_path(made - 600, end)?;
-    let policy = policy_at(store, made)?;
+    let policy = policy_at(store, made, &vault)?;
     let keeper_hours = shadow::hours_for(&tables, None, &policy);
     let Some(keeper) = shadow::replay(&policy, &keeper_hours, &path, made, 86_400, None) else { return Ok(None) };
 
@@ -411,11 +423,12 @@ fn rules_of(version: &str) -> String {
 
 /// The keeper's current rules version and the time of the first run under it (after the last run
 /// of any other version). Runs that predate version logging count as other versions.
-pub fn current_rules(store: &Store) -> Result<Option<(String, i64)>> {
+pub fn current_rules(store: &Store, vault: &str) -> Result<Option<(String, i64)>> {
     let runs: Vec<(i64, Option<String>)> = {
-        let mut st =
-            store.db.prepare("SELECT ts, json_extract(json, '$.keeper_version') FROM keeper_rows WHERE tbl = 'keeper_runs' ORDER BY ts")?;
-        let r = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let mut st = store.db.prepare(
+            "SELECT ts, json_extract(json, '$.keeper_version') FROM keeper_rows WHERE tbl = 'keeper_runs' AND vault = ?1 ORDER BY ts",
+        )?;
+        let r = st.query_map([vault], |r| Ok((r.get(0)?, r.get(1)?)))?;
         r.collect::<std::result::Result<_, _>>()?
     };
     let Some(latest) = runs.iter().rev().find_map(|(_, v)| v.clone()) else { return Ok(None) };
@@ -452,19 +465,19 @@ fn twap_at(path: &[(i64, f64, Option<f64>)], t: i64, secs: i64) -> Option<f64> {
     (w.len() >= 2).then(|| w.iter().sum::<f64>() / w.len() as f64)
 }
 
-/// Checks the rules engine against the keeper's own history rows in the A.I's database.
-pub fn fidelity(store: &Store) -> Result<Fidelity> {
+/// Checks the rules engine against one vault's keeper's own history rows in the A.I's database.
+pub fn fidelity(store: &Store, vault: &str) -> Result<Fidelity> {
     let mut f = Fidelity::default();
     // 1. Width choice: every logged width table.
     let rows: Vec<(i64, String)> = {
-        let mut st = store.db.prepare("SELECT ts, json FROM keeper_rows WHERE tbl = 'width_evals' ORDER BY ts")?;
-        let r = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let mut st = store.db.prepare("SELECT ts, json FROM keeper_rows WHERE tbl = 'width_evals' AND vault = ?1 ORDER BY ts")?;
+        let r = st.query_map([vault], |r| Ok((r.get(0)?, r.get(1)?)))?;
         r.collect::<std::result::Result<_, _>>()?
     };
     let mut tables: Vec<shadow::Table> = Vec::new();
     for (ts, raw) in &rows {
         let Some(t) = serde_json::from_str::<Value>(raw).ok().and_then(|v| shadow::Table::from_keeper(&v)) else { continue };
-        let p = policy_at(store, *ts)?;
+        let p = policy_at(store, *ts, vault)?;
         let nets: Vec<(i64, f64)> = t.rows.iter().map(|r| (r.h as i64, r.net)).collect();
         let c = shadow::choose(&t, &nets, &p);
         f.choices.1 += 1;
@@ -477,8 +490,10 @@ pub fn fidelity(store: &Store) -> Result<Fidelity> {
     }
     // 2. Out-of-range clocks: every logged "TWAP outside for X".
     let decisions: Vec<Value> = {
-        let mut st = store.db.prepare("SELECT json FROM keeper_rows WHERE tbl = 'keeper_decisions' AND json LIKE '%TWAP outside for%'")?;
-        let r = st.query_map([], |r| r.get::<_, String>(0))?;
+        let mut st = store
+            .db
+            .prepare("SELECT json FROM keeper_rows WHERE tbl = 'keeper_decisions' AND vault = ?1 AND json LIKE '%TWAP outside for%'")?;
+        let r = st.query_map([vault], |r| r.get::<_, String>(0))?;
         r.filter_map(|x| x.ok()).filter_map(|x| serde_json::from_str(&x).ok()).collect()
     };
     let mut seen = std::collections::HashSet::new();
@@ -494,7 +509,7 @@ pub fn fidelity(store: &Store) -> Result<Fidelity> {
         let Some(logged) = reason.strip_prefix("TWAP outside for ").and_then(|r| r.split(" of ").next()).and_then(parse_dur) else {
             continue;
         };
-        let p = policy_at(store, ts)?;
+        let p = policy_at(store, ts, vault)?;
         let path = store.pool_path(ts - logged - 2 * 3600, ts + 60)?;
         // Walk back from ts while the TWAP stays outside the range.
         let mut t = ts / 60 * 60;
@@ -518,16 +533,16 @@ pub fn fidelity(store: &Store) -> Result<Fidelity> {
     }
     // 3. Real rebalances: replay from the position's real range and compare the time.
     let events: Vec<Value> = {
-        let mut st = store.db.prepare("SELECT json FROM keeper_rows WHERE tbl = 'position_events' ORDER BY ts")?;
-        let r = st.query_map([], |r| r.get::<_, String>(0))?;
+        let mut st = store.db.prepare("SELECT json FROM keeper_rows WHERE tbl = 'position_events' AND vault = ?1 ORDER BY ts")?;
+        let r = st.query_map([vault], |r| r.get::<_, String>(0))?;
         r.filter_map(|x| x.ok()).filter_map(|x| serde_json::from_str::<Value>(&x).ok()).filter(|v| v["kind"] == "rebalance").collect()
     };
     let starts: Vec<i64> = {
-        let mut st = store.db.prepare("SELECT ts FROM keeper_rows WHERE tbl = 'keeper_runs' ORDER BY ts")?;
-        let r = st.query_map([], |r| r.get(0))?;
+        let mut st = store.db.prepare("SELECT ts FROM keeper_rows WHERE tbl = 'keeper_runs' AND vault = ?1 ORDER BY ts")?;
+        let r = st.query_map([vault], |r| r.get(0))?;
         r.collect::<std::result::Result<_, _>>()?
     };
-    let rules = current_rules(store)?;
+    let rules = current_rules(store, vault)?;
     f.rules_version = rules.as_ref().map(|r| r.0.clone());
     f.rules_since = rules.as_ref().map(|r| r.1);
     let mut done = std::collections::HashSet::new();
@@ -539,7 +554,7 @@ pub fn fidelity(store: &Store) -> Result<Fidelity> {
         if !done.insert((ts / 60, lo as i64, hi as i64)) {
             continue; // several positions with the same range rebalanced in one heartbeat
         }
-        let p = policy_at(store, ts)?;
+        let p = policy_at(store, ts, vault)?;
         let path = store.pool_path(ts - 40 * 3600, ts + 3 * 3600)?;
         // Start where the TWAP was last inside the range (or at the keeper's last restart, which
         // resets its clocks), so the replay's clock starts where the keeper's did.
@@ -750,8 +765,8 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(make_shadow(&s, ts + 25 * 3600).unwrap(), 25);
-        assert_eq!(make_shadow(&s, ts + 25 * 3600).unwrap(), 0, "not twice");
+        assert_eq!(make_shadow(&s, ts + 25 * 3600, crate::collect::bucket::OLD).unwrap(), 25);
+        assert_eq!(make_shadow(&s, ts + 25 * 3600, crate::collect::bucket::OLD).unwrap(), 0, "not twice");
         // Not gradable before 24 h have passed; gradable after.
         assert_eq!(resolve(&s, ts + 3600).unwrap(), 0);
         let graded = resolve(&s, ts + 86_400 + 60).unwrap();
@@ -776,8 +791,8 @@ mod tests {
             [json!({"policy": {"confirmation_secs": 10800}}).to_string()],
         )
         .unwrap();
-        assert_eq!(policy_at(&s, 50).unwrap().confirmation_secs, 21_600, "before the start: defaults");
-        assert_eq!(policy_at(&s, 150).unwrap().confirmation_secs, 10_800, "after: the logged policy");
+        assert_eq!(policy_at(&s, 50, crate::collect::bucket::OLD).unwrap().confirmation_secs, 21_600, "before the start: defaults");
+        assert_eq!(policy_at(&s, 150, crate::collect::bucket::OLD).unwrap().confirmation_secs, 10_800, "after: the logged policy");
     }
 
     #[test]
@@ -794,15 +809,15 @@ mod tests {
             )
             .unwrap();
         };
-        assert_eq!(current_rules(&s).unwrap(), None, "no runs, no rules");
+        assert_eq!(current_rules(&s, crate::collect::bucket::OLD).unwrap(), None, "no runs, no rules");
         run(100, None); // before versions were logged
         run(200, Some("0.7.0"));
         run(300, Some("0.8.0"));
         run(400, Some("0.8.1")); // a patch release keeps the rules
-        assert_eq!(current_rules(&s).unwrap(), Some(("0.8".into(), 300)));
+        assert_eq!(current_rules(&s, crate::collect::bucket::OLD).unwrap(), Some(("0.8".into(), 300)));
         run(500, Some("0.7.0")); // rolled back
         run(600, Some("0.8.1")); // and forward again: the rules count from here
-        assert_eq!(current_rules(&s).unwrap(), Some(("0.8".into(), 600)));
+        assert_eq!(current_rules(&s, crate::collect::bucket::OLD).unwrap(), Some(("0.8".into(), 600)));
     }
 
     #[test]

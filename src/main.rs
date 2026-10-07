@@ -98,13 +98,13 @@ async fn main() -> Result<()> {
         Cmd::Backfill { days, eth_days, no_bucket, no_chain } => backfill(&cfg, t, days, eth_days.max(days), no_bucket, no_chain).await,
         Cmd::Replay { days } => {
             let s = store::Store::open(&cfg.db_path())?;
-            println!("{}", replay::run(&s, t, days)?);
+            println!("{}", replay::run(&s, t, days, &cfg.primary_vault)?);
             Ok(())
         }
         Cmd::Predict => {
             let s = store::Store::open(&cfg.db_path())?;
             let m = registry::make_predictions(&s, t)?;
-            let sh = registry::make_shadow(&s, t)?;
+            let sh = registry::make_shadow(&s, t, &cfg.primary_vault)?;
             println!("forecasts: {} volatility models, {} range-exit rows; {} new shadow decisions", m.vol_models, m.exit_rows, sh);
             Ok(())
         }
@@ -142,14 +142,15 @@ async fn main() -> Result<()> {
             if send {
                 println!("{}", brief::deliver(&cfg, &s, t, false).await?);
             } else {
-                let (subject, body) = brief::build(&s, t)?;
+                let (subject, body) = brief::build(&s, t, &cfg.primary_vault)?;
                 println!("{subject}\n\n{body}");
             }
             Ok(())
         }
         Cmd::Verify => {
             let s = store::Store::open(&cfg.db_path())?;
-            let f = registry::fidelity(&s)?;
+            let f = registry::fidelity(&s, &cfg.primary_vault)?;
+            println!("keeper checked: {}", alerts::vault_name(&cfg.primary_vault));
             println!("width choices reproduced:   {} of {}", f.choices.0, f.choices.1);
             println!("out-of-range clocks within 10 min: {} of {}", f.clocks.0, f.clocks.1);
             match (&f.rules_version, f.rules_since) {
@@ -321,7 +322,12 @@ async fn backfill(cfg: &config::Config, t: i64, days: i64, eth_days: i64, no_buc
             let b = bucket::Bucket { web: &web, name: name.clone(), token: cfg.gcs_token.clone() };
             let days = bucket::days_between(&cfg.bucket_start, t);
             println!("Keeper bucket: {} days from {} (every file archived and decoded)...", days.len(), cfg.bucket_start);
-            let (o, r) = bucket::sync_days(&b, &s, &days, bucket::Mode::History).await?;
+            let sources = bucket::sources(&b).await?;
+            println!("  keepers: {}", sources.iter().map(|x| alerts::vault_name(&x.vault)).collect::<Vec<_>>().join(", "));
+            let (o, r) = bucket::sync_days(&b, &s, &sources, &days, bucket::Mode::History).await?;
+            for x in sources.iter().filter(|x| x.vault != bucket::OLD) {
+                s.meta_set(&format!("bucket_backfilled:{}", x.vault), &t.to_string())?;
+            }
             println!("  {o} files, {r} rows");
         }
     }
@@ -344,11 +350,11 @@ async fn backfill(cfg: &config::Config, t: i64, days: i64, eth_days: i64, no_buc
         None => println!("HAR: not enough history yet"),
     }
     // The past replayed, so the champion and the brief learn from the bad days too.
-    match replay::run(&s, t, eth_days) {
+    match replay::run(&s, t, eth_days, &cfg.primary_vault) {
         Ok(r) => println!("Replay: {r}"),
         Err(e) => println!("Replay: {e:#}"),
     }
-    println!("Shadow decisions from history: {}", registry::make_shadow(&s, t)?);
+    println!("Shadow decisions from history: {}", registry::make_shadow(&s, t, &cfg.primary_vault)?);
     println!("Graded: {}", registry::resolve(&s, t)?);
     Ok(())
 }

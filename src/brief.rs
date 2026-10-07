@@ -1,7 +1,18 @@
-//! The daily brief: one plain-English email a day to the owner. Built from the numbers by code (no
-//! paid AI service; the budget is $0). If email is not configured it is written to
+//! The daily brief: one email a day to the owner, built from the numbers by code (no paid AI
+//! service; the budget is $0). If email is not configured it is written to
 //! `<data dir>/briefs/YYYY-MM-DD.txt` instead.
+//!
+//! Written to be read by a person, not a machine (owner 2026-10-07: "right now it just looks like a
+//! bunch of gibberish to me, it needs to speak to me like a human"). It opens with the short version
+//! (does anything need you, how each vault did, the market, what the A.I learned), then explains
+//! each part in sentences. Every number the old brief carried is still there, at the end, under
+//! TECHNICAL DETAIL, for anyone who wants to check the working.
+//!
+//! Vaults (2026-10-07): the original vault's keeper and each vault of the multi-vault platform are
+//! reported separately; the A.I follows the live one (`primary`, AIK_PRIMARY_VAULT).
 
+use crate::alerts::vault_name;
+use crate::collect::bucket::OLD;
 use crate::config::{Config, Email};
 use crate::registry;
 use crate::store::Store;
@@ -15,6 +26,11 @@ fn pct(x: f64) -> String {
 
 fn day(ts: i64) -> String {
     chrono::DateTime::from_timestamp(ts, 0).map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default()
+}
+
+/// "Tuesday 6 October".
+fn long_day(ts: i64) -> String {
+    chrono::DateTime::from_timestamp(ts, 0).map(|d| d.format("%A %-d %B").to_string()).unwrap_or_default()
 }
 
 /// "2026-09-23 22:53 UTC".
@@ -35,6 +51,15 @@ fn move_line(store: &Store, source: &str, since: i64, now: i64, fmt: &dyn Fn(f64
     })
 }
 
+/// First and last close of a price_1m source in the window.
+fn first_last(store: &Store, source: &str, since: i64, now: i64) -> Result<Option<(f64, f64)>> {
+    let p = store.prices(source, since - 3600, now)?;
+    Ok(match (p.first(), p.last()) {
+        (Some((_, a)), Some((_, z))) if *a > 0.0 => Some((*a, *z)),
+        _ => None,
+    })
+}
+
 fn usd_short(x: f64) -> String {
     if x.abs() >= 1e6 {
         format!("${:.2}M", x / 1e6)
@@ -45,14 +70,204 @@ fn usd_short(x: f64) -> String {
     }
 }
 
+/// Thousands separators: 2349.2 -> "2,349".
+fn commas(x: f64) -> String {
+    let n = x.round().abs() as u64;
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    if x < 0.0 && n > 0 {
+        format!("-{out}")
+    } else {
+        out
+    }
+}
+
+/// Dollars for a person: "$2,349" for larger amounts, "$12.73" for small ones, "$0.03" for cents.
+fn money(x: f64) -> String {
+    if x.abs() >= 1000.0 {
+        format!("${}", commas(x))
+    } else {
+        format!("${x:.2}")
+    }
+}
+
+/// "rose 1.90%", "fell 2.11%", "barely moved (+0.03%)".
+fn moved(pct_change: f64) -> String {
+    if pct_change.abs() < 0.25 {
+        format!("barely moved ({pct_change:+.2}%)")
+    } else if pct_change > 0.0 {
+        format!("rose {pct_change:.2}%")
+    } else {
+        format!("fell {:.2}%", -pct_change)
+    }
+}
+
+/// The keeper's own calm/active/storm lines (per sqrt hour).
+fn vol_words(v: f64) -> &'static str {
+    if v < 0.005 {
+        "calm"
+    } else if v < 0.01 {
+        "fairly busy"
+    } else {
+        "stormy"
+    }
+}
+
+fn fear_greed_words(x: f64) -> &'static str {
+    match x as i64 {
+        i64::MIN..=24 => "extreme fear",
+        25..=44 => "fearful",
+        45..=55 => "neutral",
+        56..=74 => "greedy",
+        _ => "extremely greedy",
+    }
+}
+
+/// A share as a person reads it: "0.04%", "less than 0.01%".
+fn share_words(x: f64) -> String {
+    let p = x * 100.0;
+    if p <= 0.0 {
+        "none".into()
+    } else if p < 0.01 {
+        "less than 0.01%".into()
+    } else if p < 1.0 {
+        format!("{p:.2}%")
+    } else {
+        format!("{p:.1}%")
+    }
+}
+
+fn plural(n: i64, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// What one vault's keeper saw in the window and holds now.
+#[derive(Default, Debug)]
+struct VaultDay {
+    vault: String,
+    deposits: i64,
+    deposit_usd: f64,
+    top_ups: i64,
+    top_up_usd: f64,
+    withdrawals: i64,
+    rebalances: i64,
+    rebalance_gas: f64,
+    payouts: i64,
+    /// Open positions in the keeper's latest snapshot (none if it is more than 3 hours old).
+    positions: i64,
+    positions_usd: f64,
+    in_range: i64,
+    in_range_liquidity: f64,
+    snapshot_ts: Option<i64>,
+    /// The width the keeper would open a new position at (half-width, %), and when it said so.
+    width: Option<(i64, f64)>,
+    /// Newest row of any kind from this keeper.
+    newest: Option<i64>,
+}
+
+fn vault_day(store: &Store, vault: &str, since: i64, now: i64) -> Result<VaultDay> {
+    let mut d = VaultDay { vault: vault.to_string(), ..Default::default() };
+    let events: Vec<Value> = {
+        let mut st = store.db.prepare("SELECT json FROM keeper_rows WHERE tbl = 'position_events' AND vault = ?2 AND ts > ?1 ORDER BY ts")?;
+        let r = st.query_map(rusqlite::params![since, vault], |r| r.get::<_, String>(0))?;
+        r.filter_map(|x| x.ok()).filter_map(|s| serde_json::from_str(&s).ok()).collect()
+    };
+    for e in &events {
+        match e["kind"].as_str().unwrap_or("") {
+            "deposit" => {
+                d.deposits += 1;
+                d.deposit_usd += e["deposit_usd"].as_f64().unwrap_or(0.0);
+            }
+            "top_up" => {
+                d.top_ups += 1;
+                d.top_up_usd += e["top_up_usd"].as_f64().unwrap_or(0.0);
+            }
+            // Every way a position can leave (a forced exit's batch transaction, `force_exit_batch`, is
+            // the keeper's own and is counted once per position through `force_exit`).
+            "withdraw" | "emergency_exit" | "emergency_withdraw" | "raw_nft_withdraw" | "force_exit" => d.withdrawals += 1,
+            "rebalance" => {
+                d.rebalances += 1;
+                d.rebalance_gas += e["cost_usd"].as_f64().unwrap_or(0.0);
+            }
+            "reward_paid" => d.payouts += 1,
+            _ => {}
+        }
+    }
+    // Open positions: each position's newest snapshot, when the keeper's latest snapshot is recent.
+    let latest: Option<i64> = store.db.query_row("SELECT MAX(ts) FROM position_min WHERE vault = ?1", [vault], |r| r.get(0))?;
+    if let Some(l) = latest.filter(|l| now - l < 3 * 3600) {
+        d.snapshot_ts = Some(l);
+        let mut st = store.db.prepare(
+            "SELECT p.position_usd, p.in_range, CAST(p.liquidity AS REAL) FROM position_min p
+             WHERE p.vault = ?1 AND p.ts > ?2 AND p.ts = (SELECT MAX(q.ts) FROM position_min q WHERE q.vault = ?1 AND q.token_id = p.token_id)",
+        )?;
+        let rows = st.query_map(rusqlite::params![vault, l - 900], |r| {
+            Ok((r.get::<_, Option<f64>>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, Option<f64>>(2)?))
+        })?;
+        for (usd, inr, liq) in rows.filter_map(|x| x.ok()) {
+            d.positions += 1;
+            d.positions_usd += usd.unwrap_or(0.0);
+            if inr == Some(1) {
+                d.in_range += 1;
+                d.in_range_liquidity += liq.unwrap_or(0.0);
+            }
+        }
+    }
+    let width: Option<(i64, String)> = store
+        .db
+        .query_row(
+            "SELECT ts, json FROM keeper_rows WHERE tbl = 'width_evals' AND vault = ?1 ORDER BY ts DESC LIMIT 1",
+            [vault],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
+    d.width = width.and_then(|(ts, raw)| {
+        let v: Value = serde_json::from_str(&raw).ok()?;
+        Some((ts, v["choice"].as_f64()? * 0.5))
+    });
+    d.newest = store.db.query_row(
+        "SELECT MAX(t) FROM (SELECT MAX(ts) AS t FROM keeper_rows WHERE vault = ?1 UNION ALL SELECT MAX(ts) FROM position_min WHERE vault = ?1
+                            UNION ALL SELECT MAX(ts) FROM decision_min WHERE vault = ?1)",
+        [vault],
+        |r| r.get(0),
+    )?;
+    Ok(d)
+}
+
+/// "3 deposits ($520.10), 1 top-up ($50.00), 2 withdrawals, 1 range move ($0.03 of gas), 4 reward payouts",
+/// or None for a quiet day.
+fn activity_words(d: &VaultDay) -> Option<String> {
+    let mut parts = Vec::new();
+    if d.deposits > 0 {
+        parts.push(format!("{} ({})", plural(d.deposits, "new deposit", "new deposits"), money(d.deposit_usd)));
+    }
+    if d.top_ups > 0 {
+        parts.push(format!("{} ({})", plural(d.top_ups, "top-up", "top-ups"), money(d.top_up_usd)));
+    }
+    if d.withdrawals > 0 {
+        parts.push(plural(d.withdrawals, "withdrawal", "withdrawals"));
+    }
+    if d.rebalances > 0 {
+        parts.push(format!("{} by the keeper ({} of gas)", plural(d.rebalances, "range move", "range moves"), money(d.rebalance_gas)));
+    }
+    if d.payouts > 0 {
+        parts.push(plural(d.payouts, "reward payout", "reward payouts"));
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
 /// Swap totals of a window: count, volume, largest, WETH bought, WETH sold, lowest and highest tick.
 type SwapTotals = (i64, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<i64>, Option<i64>);
 
-/// The pool section: everything the A.I saw happen in the Panda pool and its gauge.
-fn pool_section(b: &mut String, store: &Store, since: i64, now: i64) -> Result<()> {
-    writeln!(b, "\nPOOL (last 24 h, read straight from Base)")?;
-    // Swaps: token0 is WETH, token1 USDC; amount0 < 0 means WETH left the pool (traders bought it).
-    let (n, vol, big, bought, sold, lo, hi): SwapTotals = store.db.query_row(
+fn swap_totals(store: &Store, since: i64) -> Result<SwapTotals> {
+    // token0 is WETH, token1 USDC; amount0 < 0 means WETH left the pool (traders bought it).
+    Ok(store.db.query_row(
         "SELECT COUNT(*), SUM(usd), MAX(usd),
                 SUM(CASE WHEN CAST(amount0 AS REAL) < 0 THEN -CAST(amount0 AS REAL) ELSE 0 END) / 1e18,
                 SUM(CASE WHEN CAST(amount0 AS REAL) > 0 THEN CAST(amount0 AS REAL) ELSE 0 END) / 1e18,
@@ -60,7 +275,39 @@ fn pool_section(b: &mut String, store: &Store, since: i64, now: i64) -> Result<(
          FROM swaps WHERE ts > ?1",
         [since],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
-    )?;
+    )?)
+}
+
+/// The pool as read at or before `at`: (liquidity at the price, staked part of it, AERO per second to stakers, AERO price).
+fn pool_obs(store: &Store, at: i64) -> Option<(f64, f64, Option<f64>, Option<f64>)> {
+    store
+        .db
+        .query_row(
+            "SELECT CAST(liquidity AS REAL), CAST(staked_liquidity AS REAL), reward_rate, aero_usd FROM pool_obs
+             WHERE ts <= ?1 AND staked_liquidity IS NOT NULL ORDER BY ts DESC LIMIT 1",
+            [at],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .ok()
+}
+
+/// The average half-width (%) of the ranges other LPs opened in the window.
+fn other_lp_width(store: &Store, since: i64) -> Result<Option<f64>> {
+    Ok(store
+        .db
+        .query_row(
+            "SELECT SUM(width_ticks_mean * events) / NULLIF(SUM(CASE WHEN width_ticks_mean IS NULL THEN 0 ELSE events END), 0)
+             FROM lp_minute WHERE ts > ?1 AND kind = 'mint'",
+            [since],
+            |r| r.get::<_, Option<f64>>(0),
+        )?
+        .map(|w| w / 200.0))
+}
+
+/// The pool section of the technical detail: everything the A.I saw happen in the Panda pool and its gauge.
+fn pool_section(b: &mut String, store: &Store, since: i64, now: i64, vaults: &[VaultDay]) -> Result<()> {
+    writeln!(b, "\nPOOL (last 24 h, read straight from Base)")?;
+    let (n, vol, big, bought, sold, lo, hi) = swap_totals(store, since)?;
     if n == 0 {
         writeln!(b, "  Swaps: none recorded yet")?;
     } else {
@@ -111,41 +358,24 @@ fn pool_section(b: &mut String, store: &Store, since: i64, now: i64) -> Result<(
             g("early_withdraw_penalty").0
         )?;
     }
-    // Staked liquidity at the price, now and a day ago, and Panda's share of it.
-    let obs = |at: i64| -> Option<(f64, f64, Option<f64>, Option<f64>)> {
-        store
-            .db
-            .query_row(
-                "SELECT CAST(liquidity AS REAL), CAST(staked_liquidity AS REAL), reward_rate, aero_usd FROM pool_obs
-                 WHERE ts <= ?1 AND staked_liquidity IS NOT NULL ORDER BY ts DESC LIMIT 1",
-                [at],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .ok()
-    };
-    if let Some((active, staked, rate, aero)) = obs(now) {
-        let before = obs(since).map(|(a, s, _, _)| if a > 0.0 { format!(" (a day ago {:.0}%)", s / a * 100.0) } else { String::new() });
+    if let Some((active, staked, rate, aero)) = pool_obs(store, now) {
+        let before =
+            pool_obs(store, since).map(|(a, s, _, _)| if a > 0.0 { format!(" (a day ago {:.0}%)", s / a * 100.0) } else { String::new() });
         writeln!(
             b,
             "  Staked share of the liquidity at the price: {:.0}%{}",
             if active > 0.0 { staked / active * 100.0 } else { 0.0 },
             before.unwrap_or_default()
         )?;
-        let panda: Option<f64> = store
-            .db
-            .query_row(
-                "SELECT SUM(CAST(liquidity AS REAL)) FROM position_min WHERE in_range = 1 AND ts = (SELECT MAX(ts) FROM position_min)",
-                [],
-                |r| r.get(0),
-            )
-            .ok()
-            .flatten();
-        if let (Some(p), true) = (panda, staked > 0.0) {
-            writeln!(
-                b,
-                "  Panda's in-range positions hold {:.2}% of the staked liquidity at the price (their share of the emissions right now)",
-                p / staked * 100.0
-            )?;
+        if staked > 0.0 {
+            for d in vaults.iter().filter(|d| d.snapshot_ts.is_some()) {
+                writeln!(
+                    b,
+                    "  {}: in-range positions hold {:.4}% of the staked liquidity at the price (their share of the emissions right now)",
+                    vault_name(&d.vault),
+                    d.in_range_liquidity / staked * 100.0
+                )?;
+            }
         }
         if let Some(r) = rate {
             let per_day = r * 86_400.0;
@@ -163,7 +393,7 @@ fn pool_section(b: &mut String, store: &Store, since: i64, now: i64) -> Result<(
         // Where the staked competition sits: staked liquidity at ±1/2/5% relative to at the price.
         let map_ts: Option<i64> = store.db.query_row("SELECT MAX(ts) FROM tick_liquidity", [], |r| r.get(0))?;
         if let (Some(mt), Some((_, cur))) = (map_ts, store.series_at("pool", "map_current_tick", now)?) {
-            if let Some((a, s, _, _)) = obs(mt) {
+            if let Some((a, s, _, _)) = pool_obs(store, mt) {
                 let prof = crate::collect::liquidity::profile(store, mt, cur as i64, a, s)?;
                 let at = |dt: i64| prof.iter().rev().find(|r| r.0 <= cur as i64 + dt).map(|r| r.2);
                 if let Some(here) = at(0).filter(|h| *h > 0.0) {
@@ -206,16 +436,433 @@ fn pool_section(b: &mut String, store: &Store, since: i64, now: i64) -> Result<(
     Ok(())
 }
 
-/// Builds the brief for the 24 hours ending at `now`.
-pub fn build(store: &Store, now: i64) -> Result<(String, String)> {
-    let since = now - 86_400;
-    let mut b = String::new();
-    let subject = format!("Panda A.I Keeper: daily brief {}", day(now));
-    writeln!(b, "Panda A.I Keeper — daily brief for {} (UTC)", day(now))?;
-    writeln!(b, "Watch-only: it cannot sign, send or change anything.\n")?;
+/// Every vault the A.I has keeper history for: the live one first, the others after, the original vault last.
+fn vaults_in_order(store: &Store, primary: &str) -> Result<Vec<String>> {
+    let mut v = crate::alerts::new_vaults(store)?;
+    v.sort_by_key(|x| x != primary);
+    if !v.iter().any(|x| x == primary) && primary != OLD {
+        v.insert(0, primary.to_string());
+    }
+    let has_old = store.count("SELECT COUNT(*) FROM keeper_rows WHERE vault = 'old'", &[])? > 0;
+    if has_old || primary == OLD {
+        v.retain(|x| x != OLD);
+        v.push(OLD.to_string());
+    }
+    Ok(v)
+}
 
-    // 1. Market.
-    writeln!(b, "MARKET (last 24 h)")?;
+/// Builds the brief for the 24 hours ending at `now`. `primary`: the vault the A.I follows.
+pub fn build(store: &Store, now: i64, primary: &str) -> Result<(String, String)> {
+    let since = now - 86_400;
+    let order = vaults_in_order(store, primary)?;
+    let vaults: Vec<VaultDay> = order.iter().map(|v| vault_day(store, v, since, now)).collect::<Result<_>>()?;
+
+    // ---------- the facts every section draws on ----------
+    let open_alerts: Vec<(String, i64, i64)> =
+        serde_json::from_str(&store.meta_get("alerts_open")?.unwrap_or_else(|| "[]".into())).unwrap_or_default();
+    let alert_text = |key: &str| -> String {
+        store
+            .db
+            .query_row("SELECT message FROM alerts WHERE key = ?1 AND state = 'open' ORDER BY ts DESC LIMIT 1", [key], |r| r.get(0))
+            .unwrap_or_else(|_| key.to_string())
+    };
+    let bad_sites: Vec<(String, i64, String)> = {
+        let mut st = store.db.prepare("SELECT url, status, COALESCE(note, '') FROM site_checks WHERE ts > ?1 AND (status < 200 OR status >= 400) ORDER BY ts DESC LIMIT 5")?;
+        let rows = st.query_map([since], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    let eth = first_last(store, "coinbase", since, now)?;
+    let coin = store.prices("coinbase", since - 3600, now)?;
+    let realised = crate::model::vol::realised(&coin, since, now);
+    let forecasts = crate::model::vol::forecasts(store, now, 24)?;
+    let champion = registry::champion(store, now)?;
+    let (_, shadow7) = registry::scorecard(store, now, 7)?;
+    let fid = registry::fidelity(store, primary)?;
+    let live = vaults.first();
+
+    let mut b = String::new();
+    // ---------- subject ----------
+    let status = if open_alerts.is_empty() && bad_sites.is_empty() {
+        "all normal".to_string()
+    } else {
+        let n = open_alerts.len() as i64 + i64::from(!bad_sites.is_empty());
+        format!("{} need a look", plural(n, "thing", "things"))
+    };
+    let mut subject = format!("Panda daily, {}: {status}", long_day(now));
+    if let Some((a, z)) = eth {
+        subject += &format!(" · ETH {:+.1}%", (z / a - 1.0) * 100.0);
+    }
+    if let Some(d) = live.filter(|d| d.snapshot_ts.is_some()) {
+        subject += &format!(" · {} in {}", money(d.positions_usd), plural(d.positions, "position", "positions"));
+    }
+
+    writeln!(b, "Hi! Here is how Panda did in the 24 hours up to {}.", when(now))?;
+    writeln!(b, "(I only watch and learn: I cannot move money, sign anything or change the keeper.)\n")?;
+
+    // ---------- 1. the short version ----------
+    writeln!(b, "THE SHORT VERSION")?;
+    if open_alerts.is_empty() && bad_sites.is_empty() {
+        writeln!(b, "• Nothing needs your attention.")?;
+    } else {
+        writeln!(b, "• NEEDS A LOOK:")?;
+        for (key, first, _) in &open_alerts {
+            writeln!(b, "    - {} (since {})", alert_text(key), when(*first))?;
+        }
+        if let Some((u, s, n)) = bad_sites.first() {
+            writeln!(b, "{}", format!("    - The website had trouble: {u} answered {s} {n}").trim_end())?;
+        }
+    }
+    for d in &vaults {
+        let name = vault_name(&d.vault);
+        let mut line = match d.snapshot_ts {
+            Some(_) => format!(
+                "• {}{}: {} worth {} in total, {} earning rewards right now",
+                capitalise(&name),
+                if d.vault == primary { " (the live one)" } else { "" },
+                plural(d.positions, "position", "positions"),
+                money(d.positions_usd),
+                d.in_range
+            ),
+            None => format!("• {}: no recent snapshot from its keeper", capitalise(&name)),
+        };
+        match activity_words(d) {
+            Some(a) => line += &format!(". Today: {a}."),
+            None => line += ". A quiet day: no deposits, withdrawals or range moves.",
+        }
+        writeln!(b, "{line}")?;
+    }
+    if let Some((a, z)) = eth {
+        writeln!(
+            b,
+            "• ETH {} to {}{}.",
+            moved((z / a - 1.0) * 100.0),
+            money(z),
+            realised.map(|v| format!(", a {} day", vol_words(v))).unwrap_or_default()
+        )?;
+    }
+    if let Some(s) = &shadow7 {
+        writeln!(b, "• The A.I {}.", ai_verdict(s))?;
+    }
+
+    // ---------- 2. the vaults ----------
+    writeln!(b, "\nYOUR VAULTS")?;
+    for d in &vaults {
+        writeln!(b, "{}{}", capitalise(&vault_name(&d.vault)), if d.vault == primary { " (the live vault)" } else { "" })?;
+        match activity_words(d) {
+            Some(a) => writeln!(b, "  In the last 24 hours: {a}.")?,
+            None => writeln!(b, "  In the last 24 hours: nothing happened (no deposits, top-ups, withdrawals or range moves).")?,
+        }
+        match d.snapshot_ts {
+            Some(t) => {
+                let out = d.positions - d.in_range;
+                writeln!(
+                    b,
+                    "  Right now ({} UTC): {} worth {} together. {}",
+                    hm(t),
+                    plural(d.positions, "position", "positions"),
+                    money(d.positions_usd),
+                    if d.positions == 0 {
+                        "It is empty.".to_string()
+                    } else if out == 0 {
+                        "All of them are inside their price range, so they are all earning.".to_string()
+                    } else {
+                        format!(
+                            "{} earning; {} outside {} range for now (paused until the price comes back or the keeper moves {}).",
+                            d.in_range,
+                            out,
+                            if out == 1 { "its" } else { "their" },
+                            if out == 1 { "it" } else { "them" }
+                        )
+                    }
+                )?;
+            }
+            None => match d.newest {
+                Some(n) => writeln!(b, "  Its keeper's last report was {} ago ({}).", ago(now - n), when(n))?,
+                None => writeln!(b, "  Nothing from its keeper yet.")?,
+            },
+        }
+        if let Some((ts, w)) = d.width {
+            if now - ts < 6 * 3600 {
+                writeln!(
+                    b,
+                    "  A new deposit today would get a range of ±{w:.1}% around the price (the keeper picks this from how much ETH is swinging)."
+                )?;
+            }
+        }
+    }
+
+    // ---------- 3. the market ----------
+    writeln!(b, "\nTHE MARKET")?;
+    match eth {
+        Some((a, z)) => {
+            let mut l = format!("  ETH {} over the day, from {} to {}.", moved((z / a - 1.0) * 100.0), money(a), money(z));
+            if let Some(v) = realised {
+                l += &format!(
+                    " It was a {} day: prices swung about {:.2}% an hour on average (the keeper treats under 0.5% as calm).",
+                    vol_words(v),
+                    v * 100.0
+                );
+            }
+            writeln!(b, "{l}")?;
+        }
+        None => writeln!(b, "  No ETH prices were recorded today.")?,
+    }
+    let mut others = Vec::new();
+    for (src, name, digits) in [("cb:BTC-USD", "BTC", 0usize), ("cb:AERO-USD", "AERO", 4)] {
+        if let Some((a, z)) = first_last(store, src, since, now)? {
+            let price = if digits == 0 { money(z) } else { format!("${z:.digits$}") };
+            others.push(format!("{name} {} to {price}", moved((z / a - 1.0) * 100.0)));
+        }
+    }
+    if !others.is_empty() {
+        writeln!(b, "  {}.", others.join("; "))?;
+    }
+    if let Some((_, fng)) = store.series_at("alternative", "fear_greed", now)? {
+        writeln!(b, "  The crypto market mood is {} (Fear & Greed {:.0} out of 100).", fear_greed_words(fng), fng)?;
+    }
+    let (swaps_n, swap_vol, ..) = swap_totals(store, since)?;
+    if swaps_n > 0 {
+        writeln!(b, "  Our pool (WETH/USDC on Aerodrome) traded {} in {} swaps.", usd_short(swap_vol.unwrap_or(0.0)), commas(swaps_n as f64))?;
+    }
+    if let Some((_, staked, Some(rate), aero)) = pool_obs(store, now) {
+        let per_day = rate * 86_400.0;
+        let mut l = format!("  Aerodrome pays this pool's stakers {} AERO a day", commas(per_day));
+        if let Some(a) = aero {
+            l += &format!(" (about {})", money(per_day * a));
+        }
+        if let Some((_, _, Some(week_rate), _)) = pool_obs(store, now - 7 * 86_400) {
+            let ch = (rate / week_rate - 1.0) * 100.0;
+            if ch.abs() >= 1.0 {
+                l += &format!(", {:.0}% {} than a week ago", ch.abs(), if ch > 0.0 { "more" } else { "less" });
+            } else {
+                l += ", the same as a week ago";
+            }
+        }
+        if let Some(f) = store.series_at("gauge", "period_finish", now)?.map(|(_, v)| v as i64).filter(|f| *f > now) {
+            l += &format!(". The amount can change when the weekly vote ends in {}", ago(f - now));
+        }
+        writeln!(b, "{l}.")?;
+        if staked > 0.0 {
+            let share: f64 = vaults.iter().map(|d| d.in_range_liquidity).sum::<f64>() / staked;
+            if share > 0.0 {
+                let earn = aero.map(|a| format!(", roughly {} a day for everyone in Panda together", money(share * per_day * a))).unwrap_or_default();
+                writeln!(b, "  Panda's earning positions get {} of those rewards right now{earn}.", share_words(share))?;
+            }
+        }
+    }
+    if let Some(w) = other_lp_width(store, since)? {
+        writeln!(
+            b,
+            "  Other liquidity providers opened ranges of about ±{w:.1}% on average. Narrower ranges earn more per dollar while the price stays inside, but need moving more often."
+        )?;
+    }
+
+    // ---------- 4. what the A.I is learning ----------
+    writeln!(b, "\nWHAT THE A.I IS LEARNING")?;
+    writeln!(
+        b,
+        "  Every hour I pick my own range width next to the keeper's and check, a day later on the real prices, which would have earned more."
+    )?;
+    match &shadow7 {
+        Some(s) => {
+            writeln!(
+                b,
+                "  Last 7 days: {} decisions checked. We picked the same width {} times.",
+                commas(s.n as f64),
+                commas(s.same_choice as f64)
+            )?;
+            writeln!(
+                b,
+                "  On a $1,000 position the keeper's choices would have made about {} a day and mine about {} — {}.",
+                money(s.keeper_mean * 1000.0),
+                money(s.ai_mean * 1000.0),
+                compare_words(s.ai_mean, s.keeper_mean)
+            )?;
+            writeln!(
+                b,
+                "  The best width with perfect hindsight would have made {} a day: that is the ceiling nobody can reach.",
+                money(s.hindsight_mean * 1000.0)
+            )?;
+            if let Some((m, _, mean, beat)) = s.models.first() {
+                writeln!(
+                    b,
+                    "  My most promising method so far is \"{m}\" (about {} a day, ahead of the keeper in {} of {} checks).",
+                    money(mean * 1000.0),
+                    beat,
+                    s.n
+                )?;
+            }
+            if s.days < 30 {
+                writeln!(
+                    b,
+                    "  That is only {} days of evidence. I need about 30 before a lead means anything, so I am not suggesting any change to the keeper yet.",
+                    s.days
+                )?;
+            }
+        }
+        None => writeln!(b, "  Nothing has been checked yet: each decision needs a full day of prices after it.")?,
+    }
+    if let Some(v) = forecasts.get(champion.as_str()).or_else(|| forecasts.get("keeper")) {
+        writeln!(
+            b,
+            "  For tomorrow I expect a {} day (about {:.2}% an hour), using the \"{champion}\" forecast, which has been the most accurate lately.",
+            vol_words(*v),
+            v * 100.0
+        )?;
+    }
+    if fid.choices.1 > 0 {
+        let all = fid.choices.0 == fid.choices.1;
+        writeln!(
+            b,
+            "  My copy of the keeper's rules ({}) matched {} of its {} width choices{}.",
+            vault_name(primary),
+            commas(fid.choices.0 as f64),
+            commas(fid.choices.1 as f64),
+            if all { ": I understand exactly how it decides" } else { ". Some did not match, so its rules may have changed" }
+        )?;
+    }
+
+    // ---------- 5. is everything working ----------
+    writeln!(b, "\nIS EVERYTHING WORKING?")?;
+    let pool_n = store.count("SELECT COUNT(*) FROM pool_obs WHERE ts > ?1", &[&since])?;
+    let coin_n = store.count("SELECT COUNT(*) FROM price_1m WHERE source = 'coinbase' AND ts > ?1", &[&since])?;
+    let first_obs: Option<i64> = store.db.query_row("SELECT MIN(ts) FROM pool_obs", [], |r| r.get(0))?;
+    let pool_target = first_obs.filter(|f| *f > since + 1800).map(|start| (now - start) / 30).unwrap_or(2880).max(1);
+    writeln!(
+        b,
+        "  My data feeds: {:.0}% of the expected pool readings and {:.0}% of the expected ETH prices arrived.",
+        (pool_n as f64 / pool_target as f64 * 100.0).min(100.0),
+        (coin_n as f64 / 1440.0 * 100.0).min(100.0)
+    )?;
+    for d in &vaults {
+        match d.newest {
+            Some(n) if now - n < 3 * 3600 => {
+                writeln!(b, "  The keeper of {} is reporting normally (last report {} ago).", vault_name(&d.vault), ago(now - n))?
+            }
+            Some(n) => writeln!(b, "  The keeper of {} last reported {} ago.", vault_name(&d.vault), ago(now - n))?,
+            None => {}
+        }
+    }
+    if bad_sites.is_empty() {
+        writeln!(b, "  The website answered every check.")?;
+    } else {
+        for (u, s, n) in &bad_sites {
+            writeln!(b, "  The website had a problem: {u} answered {s} {n}")?;
+        }
+    }
+    let alerts: Vec<(i64, String, String, String)> = {
+        let mut st = store.db.prepare("SELECT ts, key, state, message FROM alerts WHERE ts > ?1 ORDER BY ts")?;
+        let rows = st.query_map([since], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    if alerts.is_empty() {
+        writeln!(b, "  No alerts in the last 24 hours.")?;
+    } else {
+        for (t, _, state, msg) in &alerts {
+            if state == "resolved" {
+                writeln!(b, "  {} UTC: an alert cleared.", hm(*t))?;
+            } else {
+                writeln!(b, "  {} UTC: alert: {msg}", hm(*t))?;
+            }
+        }
+    }
+    let db_bytes = std::fs::metadata(store.db.path().unwrap_or("")).map(|m| m.len() as f64).unwrap_or(0.0);
+    if db_bytes > 0.0 {
+        writeln!(
+            b,
+            "  My database is {} (plenty of room on its disk).",
+            if db_bytes >= 1e9 { format!("{:.2} GB", db_bytes / 1e9) } else { format!("{:.0} MB", db_bytes / 1e6) }
+        )?;
+    }
+
+    // ---------- 6. news and notes ----------
+    let news_n = store.count("SELECT COUNT(*) FROM news WHERE ts > ?1", &[&since])?;
+    if news_n > 0 {
+        writeln!(b, "\nIN THE NEWS (6 of {news_n} crypto headlines I kept today)")?;
+        let mut st = store.db.prepare("SELECT source, title FROM news WHERE ts > ?1 ORDER BY ts DESC LIMIT 6")?;
+        let rows = st.query_map([since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        for (src, title) in rows.filter_map(|r| r.ok()) {
+            let t: String = title.chars().take(110).collect();
+            writeln!(b, "  • {t} ({src})")?;
+        }
+    }
+    let notes: Vec<String> = {
+        let mut st = store.db.prepare("SELECT text FROM notes WHERE ts > ?1 ORDER BY ts")?;
+        let rows = st.query_map([since], |r| r.get(0))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    if !notes.is_empty() {
+        writeln!(b, "\nWHAT YOU TOLD ME (last 24 h)")?;
+        for n in notes {
+            writeln!(b, "  - {n}")?;
+        }
+    }
+    writeln!(b, "\nReply to this email to teach me: I read replies within 10 minutes and keep them with the day's decisions.")?;
+
+    // ---------- technical detail ----------
+    writeln!(b, "\n\n============================================================")?;
+    writeln!(b, "TECHNICAL DETAIL (for reference; you can skip this)")?;
+    writeln!(b, "============================================================")?;
+    technical(&mut b, store, since, now, primary, &vaults, &fid)?;
+    Ok((subject, b))
+}
+
+fn capitalise(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
+}
+
+/// "3 h 20 min", "45 min", "2 days".
+fn ago(secs: i64) -> String {
+    let m = secs.max(0) / 60;
+    if m < 60 {
+        format!("{} min", m.max(1))
+    } else if m < 48 * 60 {
+        if m % 60 == 0 || m >= 10 * 60 {
+            format!("{} h", (m + 30) / 60)
+        } else {
+            format!("{} h {} min", m / 60, m % 60)
+        }
+    } else {
+        format!("{} days", (m + 720) / 1440)
+    }
+}
+
+/// Mine against the keeper's, per day: "about the same", "mine slightly better", ...
+fn compare_words(ai: f64, keeper: f64) -> &'static str {
+    let d = (ai - keeper) * 1000.0; // dollars a day on $1,000
+    if d.abs() < 0.1 {
+        "about the same"
+    } else if d > 0.0 {
+        if d < 0.5 {
+            "mine slightly better"
+        } else {
+            "mine clearly better"
+        }
+    } else if d > -0.5 {
+        "the keeper's slightly better"
+    } else {
+        "the keeper's clearly better"
+    }
+}
+
+/// One line for the short version.
+fn ai_verdict(s: &registry::ShadowScore) -> String {
+    let agree = if s.n > 0 { s.same_choice as f64 / s.n as f64 } else { 0.0 };
+    let tail = if s.days < 30 { "; still learning, so no changes suggested" } else { "" };
+    format!(
+        "agreed with the keeper's range width {:.0}% of the time this week, and where it differed the result was {}{tail}",
+        agree * 100.0,
+        compare_words(s.ai_mean, s.keeper_mean)
+    )
+}
+
+/// Everything the brief used to show, for checking the working. Keeper rows are per vault.
+fn technical(b: &mut String, store: &Store, since: i64, now: i64, primary: &str, vaults: &[VaultDay], fid: &registry::Fidelity) -> Result<()> {
+    writeln!(b, "\nMARKET (last 24 h)")?;
     let coin = store.prices("coinbase", since - 3600, now)?;
     match (coin.first(), coin.last()) {
         (Some((_, a)), Some((_, z))) => writeln!(b, "  ETH: ${a:.0} -> ${z:.0} ({:+.2}%)", (z / a - 1.0) * 100.0)?,
@@ -289,48 +936,29 @@ pub fn build(store: &Store, now: i64) -> Result<(String, String)> {
     ) {
         writeln!(b, "  Coinbase ETH-USD book: spread {sp:.2} bp · within 1%: {} bids, {} asks", usd_short(bid), usd_short(ask))?;
     }
-    pool_section(&mut b, store, since, now)?;
+    pool_section(b, store, since, now, vaults)?;
 
-    // 2. What the keeper did.
-    writeln!(b, "\nKEEPER ACTIVITY (from its history bucket)")?;
-    let mut st = store.db.prepare("SELECT json FROM keeper_rows WHERE tbl = 'position_events' AND ts > ?1 ORDER BY ts")?;
-    let events: Vec<Value> =
-        st.query_map([since], |r| r.get::<_, String>(0))?.filter_map(|r| r.ok()).filter_map(|s| serde_json::from_str(&s).ok()).collect();
-    let count = |k: &str| events.iter().filter(|e| e["kind"] == k).count();
-    writeln!(
-        b,
-        "  Deposits {} · Rebalances {} · Reward payouts {} · Withdrawals {}",
-        count("deposit"),
-        count("rebalance"),
-        count("reward_paid"),
-        count("withdraw") + count("emergency_exit")
-    )?;
-    let dep_usd: f64 = events.iter().filter(|e| e["kind"] == "deposit").filter_map(|e| e["deposit_usd"].as_f64()).sum();
-    if dep_usd > 0.0 {
-        writeln!(b, "  New deposits: ${dep_usd:.2}")?;
-    }
-    let gas: f64 = events.iter().filter(|e| e["kind"] == "rebalance").filter_map(|e| e["cost_usd"].as_f64()).sum();
-    if count("rebalance") > 0 {
-        writeln!(b, "  Rebalance gas paid by the keeper: ${gas:.2}")?;
-    }
-    let last_width: Option<(i64, String)> = store
-        .db
-        .query_row("SELECT ts, json FROM keeper_rows WHERE tbl = 'width_evals' ORDER BY ts DESC LIMIT 1", [], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
-        .ok();
-    if let Some((ts, raw)) = last_width {
-        let v: Value = serde_json::from_str(&raw).unwrap_or_default();
+    writeln!(b, "\nKEEPER ACTIVITY (from each keeper's history in the bucket)")?;
+    for d in vaults {
         writeln!(
             b,
-            "  Latest width table ({} min old): keeper would open at ±{:.1}%",
-            (now - ts) / 60,
-            v["choice"].as_f64().unwrap_or(0.0) * 0.5
+            "  {}: deposits {} ({}) · top-ups {} ({}) · rebalances {} (gas {}) · reward payouts {} · withdrawals {}",
+            vault_name(&d.vault),
+            d.deposits,
+            money(d.deposit_usd),
+            d.top_ups,
+            money(d.top_up_usd),
+            d.rebalances,
+            money(d.rebalance_gas),
+            d.payouts,
+            d.withdrawals
         )?;
+        if let Some((ts, w)) = d.width {
+            writeln!(b, "      latest width table ({} min old): keeper would open at ±{w:.1}%", (now - ts) / 60)?;
+        }
     }
 
-    // 3. Shadow mode.
-    writeln!(b, "\nSHADOW MODE (A.I width choice vs the keeper's, replayed on real prices)")?;
+    writeln!(b, "\nSHADOW MODE (A.I width choice vs the keeper's, replayed on real prices; decisions follow {})", vault_name(primary))?;
     for (label, days) in [("7 days", 7), ("30 days", 30)] {
         let (_, sh) = registry::scorecard(store, now, days)?;
         match sh {
@@ -369,16 +997,9 @@ pub fn build(store: &Store, now: i64) -> Result<(String, String)> {
         rows.filter_map(|r| r.ok()).collect()
     };
     for (t, k, a) in recent {
-        writeln!(
-            b,
-            "  {} UTC: keeper ±{:.1}%, A.I ±{:.1}%",
-            chrono::DateTime::from_timestamp(t, 0).map(|d| d.format("%H:%M").to_string()).unwrap_or_default(),
-            k as f64 * 0.5,
-            a as f64 * 0.5
-        )?;
+        writeln!(b, "  {} UTC: keeper ±{:.1}%, A.I ±{:.1}%", hm(t), k as f64 * 0.5, a as f64 * 0.5)?;
     }
 
-    // 4. Forecast scorecard.
     writeln!(b, "\nFORECAST SCORECARD (30 days; lower is better)")?;
     let (lines, _) = registry::scorecard(store, now, 30)?;
     if lines.is_empty() {
@@ -393,25 +1014,10 @@ pub fn build(store: &Store, now: i64) -> Result<(String, String)> {
         };
         writeln!(b, "  {what:<32} {:<18} {:.4}  (n={})", l.model, l.mean_score, l.n)?;
     }
-
-    // 4a. The replayed past: good days and bad.
     if let Some(s) = crate::replay::the_past(store, now)? {
         b.push_str(&s);
     }
 
-    // 4b. Headlines.
-    let news_n = store.count("SELECT COUNT(*) FROM news WHERE ts > ?1", &[&since])?;
-    if news_n > 0 {
-        writeln!(b, "\nNEWS (last 24 h: {news_n} headlines kept)")?;
-        let mut st = store.db.prepare("SELECT source, title FROM news WHERE ts > ?1 ORDER BY ts DESC LIMIT 6")?;
-        let rows = st.query_map([since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-        for (src, title) in rows.filter_map(|r| r.ok()) {
-            let t: String = title.chars().take(110).collect();
-            writeln!(b, "  [{src}] {t}")?;
-        }
-    }
-
-    // 5. Health. During the first day the targets are scaled to how long the A.I has been collecting.
     writeln!(b, "\nHEALTH")?;
     let pool_n = store.count("SELECT COUNT(*) FROM pool_obs WHERE ts > ?1", &[&since])?;
     let coin_n = store.count("SELECT COUNT(*) FROM price_1m WHERE source = 'coinbase' AND ts > ?1", &[&since])?;
@@ -426,7 +1032,6 @@ pub fn build(store: &Store, now: i64) -> Result<(String, String)> {
         )?,
         None => writeln!(b, "  Pool reads {pool_n} (target ~2,880) · Coinbase minutes {coin_n} (target 1,440) · keeper rows {rows_n}")?,
     }
-    // Everything else it captured in the day.
     let block_since: Option<i64> = store.db.query_row("SELECT MIN(block) FROM pool_obs WHERE ts > ?1", [since], |r| r.get(0))?;
     let logs_n: i64 = match block_since {
         Some(bl) => store.count("SELECT COALESCE(SUM(logs), 0) FROM chain_log_archive WHERE from_block >= ?1", &[&bl])?,
@@ -444,17 +1049,6 @@ pub fn build(store: &Store, now: i64) -> Result<(String, String)> {
         b,
         "  Captured: {logs_n} pool/gauge events ({swaps_n} swaps) · {files_n} keeper files · {posmin_n} position-minutes · {maps_n} liquidity maps · {opt_n} option boards · {series_n} market readings · database {db_size}"
     )?;
-    let bad: Vec<(String, i64, String)> = {
-        let mut st = store.db.prepare("SELECT url, status, COALESCE(note, '') FROM site_checks WHERE ts > ?1 AND (status < 200 OR status >= 400) ORDER BY ts DESC LIMIT 5")?;
-        let rows = st.query_map([since], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
-        rows.filter_map(|r| r.ok()).collect()
-    };
-    if bad.is_empty() {
-        writeln!(b, "  Website: all checks OK")?;
-    }
-    for (u, s, n) in bad {
-        writeln!(b, "  Website problem: {u} -> {s} {n}")?;
-    }
     let feed: Option<String> = store
         .db
         .query_row("SELECT note FROM site_checks WHERE url LIKE '%/api/keeper/width' ORDER BY ts DESC LIMIT 1", [], |r| r.get(0))
@@ -462,25 +1056,14 @@ pub fn build(store: &Store, now: i64) -> Result<(String, String)> {
     if let Some(n) = feed.filter(|n| !n.is_empty()) {
         writeln!(b, "  Keeper deposit-width feed: {n}")?;
     }
-
-    // 5b. Alerts of the last day, and whether the A.I's copy of the keeper's rules still matches.
-    let alerts: Vec<(i64, String, String, String)> = {
-        let mut st = store.db.prepare("SELECT ts, key, state, message FROM alerts WHERE ts > ?1 ORDER BY ts")?;
-        let rows = st.query_map([since], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
-        rows.filter_map(|r| r.ok()).collect()
-    };
-    if alerts.is_empty() {
-        writeln!(b, "  Alerts: none in the last 24 h")?;
-    }
-    for (t, key, state, msg) in alerts {
-        let at = chrono::DateTime::from_timestamp(t, 0).map(|d| d.format("%H:%M").to_string()).unwrap_or_default();
-        writeln!(b, "  Alert {at} UTC [{state}] {key}: {msg}")?;
-    }
-    let fid = crate::registry::fidelity(store)?;
     writeln!(
         b,
-        "  Keeper-rules check: {} of {} width choices and {} of {} out-of-range clocks reproduced (all history)",
-        fid.choices.0, fid.choices.1, fid.clocks.0, fid.clocks.1
+        "  Keeper-rules check ({}): {} of {} width choices and {} of {} out-of-range clocks reproduced (all history)",
+        vault_name(primary),
+        fid.choices.0,
+        fid.choices.1,
+        fid.clocks.0,
+        fid.clocks.1
     )?;
     match (&fid.rules_version, fid.rules_since) {
         (Some(v), Some(since_ts)) => writeln!(
@@ -505,21 +1088,7 @@ pub fn build(store: &Store, now: i64) -> Result<(String, String)> {
             fid.older_rebalances.0, fid.older_rebalances.1, fid.older_widths.0, fid.older_widths.1
         )?;
     }
-
-    // 6. Owner notes.
-    let notes: Vec<String> = {
-        let mut st = store.db.prepare("SELECT text FROM notes WHERE ts > ?1 ORDER BY ts")?;
-        let rows = st.query_map([since], |r| r.get(0))?;
-        rows.filter_map(|r| r.ok()).collect()
-    };
-    if !notes.is_empty() {
-        writeln!(b, "\nYOUR NOTES (last 24 h)")?;
-        for n in notes {
-            writeln!(b, "  - {n}")?;
-        }
-    }
-    writeln!(b, "\nReply to this email to teach it: your reply is read within 10 minutes and kept with the day's decisions.")?;
-    Ok((subject, b))
+    Ok(())
 }
 
 pub async fn send(email: &Email, subject: &str, body: &str) -> Result<()> {
@@ -543,7 +1112,7 @@ pub async fn send(email: &Email, subject: &str, body: &str) -> Result<()> {
 
 /// Builds today's brief and emails it (or writes it to disk). Returns where it went.
 pub async fn deliver(cfg: &Config, store: &Store, now: i64, force_file: bool) -> Result<String> {
-    let (subject, body) = build(store, now)?;
+    let (subject, body) = build(store, now, &cfg.primary_vault)?;
     let dir = cfg.data_dir.join("briefs");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.txt", day(now)));
@@ -560,20 +1129,47 @@ pub async fn deliver(cfg: &Config, store: &Store, now: i64, force_file: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collect::bucket::PRIMARY_DEFAULT;
 
     #[test]
     fn brief_builds_on_empty_and_real_rows() {
         let s = Store::memory().unwrap();
-        let (subject, body) = build(&s, 1_790_700_000).unwrap();
-        assert!(subject.contains("daily brief"));
-        assert!(body.contains("Watch-only"));
+        let (subject, body) = build(&s, 1_790_700_000, PRIMARY_DEFAULT).unwrap();
+        assert!(subject.contains("Panda daily") && subject.contains("all normal"), "{subject}");
+        assert!(body.contains("I only watch and learn") && body.contains("THE SHORT VERSION") && body.contains("TECHNICAL DETAIL"));
         let ev = std::fs::read_to_string("tests/fixtures/position_events.json").unwrap();
-        s.db.execute("INSERT INTO keeper_rows (obj, line, tbl, ts, json) VALUES ('o', 0, 'position_events', 1790679373, ?1)", [ev.trim()])
-            .unwrap();
+        s.db.execute(
+            "INSERT INTO keeper_rows (obj, line, tbl, ts, json, vault) VALUES ('o', 0, 'position_events', 1790679373, ?1, 'old')",
+            [ev.trim()],
+        )
+        .unwrap();
         s.db.execute("INSERT INTO notes (ts, text) VALUES (1790690000, 'too narrow today')", []).unwrap();
-        let (_, body) = build(&s, 1_790_700_000).unwrap();
-        assert!(body.contains("Deposits 1"), "{body}");
-        assert!(body.contains("New deposits: $23.07"), "{body}");
+        let (_, body) = build(&s, 1_790_700_000, PRIMARY_DEFAULT).unwrap();
+        assert!(body.contains("The original vault") && body.contains("1 new deposit ($23.07)"), "{body}");
+        assert!(body.contains("deposits 1 ($23.07)"), "technical detail keeps the raw counts: {body}");
         assert!(body.contains("too narrow today"));
+    }
+
+    #[test]
+    fn plain_words() {
+        assert_eq!(moved(0.1), "barely moved (+0.10%)");
+        assert_eq!(moved(1.9), "rose 1.90%");
+        assert_eq!(moved(-2.11), "fell 2.11%");
+        assert_eq!(money(2349.2), "$2,349");
+        assert_eq!(money(12.734), "$12.73");
+        assert_eq!(commas(1_234_567.0), "1,234,567");
+        assert_eq!(vol_words(0.0034), "calm");
+        assert_eq!(vol_words(0.007), "fairly busy");
+        assert_eq!(vol_words(0.012), "stormy");
+        assert_eq!(fear_greed_words(73.0), "greedy");
+        assert_eq!(share_words(0.00004), "less than 0.01%");
+        assert_eq!(share_words(0.0004), "0.04%");
+        assert_eq!(compare_words(0.00059, 0.00064), "about the same", "$0.59 vs $0.64 a day on $1,000");
+        assert_eq!(compare_words(0.0012, 0.0005), "mine clearly better");
+        assert_eq!(compare_words(0.00040, 0.00064), "the keeper's slightly better");
+        assert_eq!(ago(45 * 60), "45 min");
+        assert_eq!(ago(3 * 3600 + 20 * 60), "3 h 20 min");
+        assert_eq!(ago(36 * 3600), "36 h");
+        assert_eq!(ago(3 * 86_400), "3 days");
     }
 }
