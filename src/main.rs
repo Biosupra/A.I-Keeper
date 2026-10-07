@@ -104,7 +104,7 @@ async fn main() -> Result<()> {
         Cmd::Selftest => selftest(&cfg, t).await,
         Cmd::Backfill { days, eth_days, no_bucket, no_chain } => backfill(&cfg, t, days, eth_days.max(days), no_bucket, no_chain).await,
         Cmd::Replay { days } => {
-            let s = store::Store::open(&cfg.db_path())?;
+            let s = store::Store::open_with_timeout(&cfg.db_path(), 300)?;
             println!("{}", replay::run(&s, t, days, &cfg.primary_vault)?);
             Ok(())
         }
@@ -315,7 +315,7 @@ async fn selftest(cfg: &config::Config, t: i64) -> Result<()> {
 }
 
 async fn backfill(cfg: &config::Config, t: i64, days: i64, eth_days: i64, no_bucket: bool, no_chain: bool) -> Result<()> {
-    let s = store::Store::open(&cfg.db_path())?;
+    let s = store::Store::open_with_timeout(&cfg.db_path(), 300)?;
     let web = net::Web::new()?;
     let rpc = net::Rpc::new(cfg.rpc_urls.clone())?;
     println!("Coinbase: filling {eth_days} days of one-minute ETH-USD (about {} requests)...", eth_days * 1440 / 300);

@@ -127,7 +127,7 @@ pub fn process(store: &Store, pool: &str, gauge: &str, from: i64, to: i64, to_ts
     let pool = pool.to_ascii_lowercase();
     let gauge = gauge.to_ascii_lowercase();
     let t = topics();
-    let tx = store.db.unchecked_transaction()?;
+    let tx = store.write_tx()?;
     let overlap: i64 =
         tx.query_row("SELECT COUNT(*) FROM chain_log_archive WHERE from_block <= ?1 AND to_block >= ?2", params![to, from], |r| r.get(0))?;
     if overlap > 0 {

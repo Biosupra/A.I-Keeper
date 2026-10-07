@@ -51,7 +51,7 @@ pub async fn snapshot_ticks(rpc: &Rpc, store: &Store, pool: &str, ts: i64) -> Re
         // A partial map would read as missing liquidity; skip this round rather than store it.
         bail!("{} of {} tick reads failed", out.iter().filter(|r| r.is_err()).count(), out.len());
     }
-    let tx = store.db.unchecked_transaction()?;
+    let tx = store.write_tx()?;
     let mut n = 0;
     for (t, r) in ticks.iter().zip(&out) {
         // ticks(): liquidityGross, liquidityNet, stakedLiquidityNet, feeGrowthOutside0/1, rewardGrowthOutside,

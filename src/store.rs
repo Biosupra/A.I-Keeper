@@ -252,12 +252,18 @@ pub fn migrate(db: &Connection) -> Result<()> {
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_timeout(path, 60)
+    }
+
+    /// `busy_secs`: how long a statement waits for another connection's write lock before failing. The
+    /// daemon uses 60 s (its jobs retry on their next turn); a manual command that runs next to the daemon
+    /// (backfill, replay) uses longer, since nothing waits on it.
+    pub fn open_with_timeout(path: &Path, busy_secs: u64) -> Result<Self> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
         let db = Connection::open(path)?;
-        // A manual command (backfill, brief) may run while the service writes: wait, don't fail.
-        db.busy_timeout(std::time::Duration::from_secs(60))?;
+        db.busy_timeout(std::time::Duration::from_secs(busy_secs))?;
         db.execute_batch(SCHEMA)?;
         migrate(&db)?;
         Ok(Store { db })

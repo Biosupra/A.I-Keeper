@@ -216,7 +216,7 @@ pub fn archive(store: &Store, vault: &str, table: &str, obj: &str, gz: &[u8], ro
     if vault != OLD {
         return archive_v(store, vault, table, obj, gz, rows);
     }
-    let tx = store.db.unchecked_transaction()?;
+    let tx = store.write_tx()?;
     let ts0 = rows.first().and_then(|r| i(&r["ts"])).unwrap_or(0);
     tx.execute(
         "INSERT OR IGNORE INTO bucket_archive (obj, tbl, ts, bytes, gz) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -280,7 +280,7 @@ pub fn archive(store: &Store, vault: &str, table: &str, obj: &str, gz: &[u8], ro
 
 /// `archive` for a multi-vault keeper: the same decoding, into the vault-keyed tables.
 fn archive_v(store: &Store, vault: &str, table: &str, obj: &str, gz: &[u8], rows: &[Value]) -> Result<usize> {
-    let tx = store.db.unchecked_transaction()?;
+    let tx = store.write_tx()?;
     let ts0 = rows.first().and_then(|r| i(&r["ts"])).unwrap_or(0);
     tx.execute(
         "INSERT OR IGNORE INTO bucket_archive (obj, tbl, ts, bytes, gz) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -345,7 +345,7 @@ fn archive_v(store: &Store, vault: &str, table: &str, obj: &str, gz: &[u8], rows
 
 /// Stores rows of one object, tagged with the vault whose keeper wrote it; returns how many were new.
 pub fn store_rows(store: &Store, vault: &str, table: &str, obj: &str, rows: &[Value]) -> Result<usize> {
-    let tx = store.db.unchecked_transaction()?;
+    let tx = store.write_tx()?;
     let mut n = 0;
     for (i, r) in rows.iter().enumerate() {
         let ts = r["ts"].as_i64().or_else(|| r["ts"].as_f64().map(|f| f as i64)).unwrap_or(0);

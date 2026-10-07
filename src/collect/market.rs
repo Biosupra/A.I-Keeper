@@ -39,7 +39,7 @@ pub async fn candles(web: &Web, store: &Store, product: &str, start: i64, end: i
     let v = web.get_json(&url, &[]).await?;
     let Some(rows) = v.as_array() else { bail!("coinbase {product}: unexpected reply") };
     let source = source_of(product);
-    let tx = store.db.unchecked_transaction()?;
+    let tx = store.write_tx()?;
     let mut n = 0;
     for r in rows {
         // [time, low, high, open, close, volume]
@@ -216,7 +216,7 @@ pub async fn options(web: &Web, store: &Store, ts: i64) -> Result<usize> {
     let v = web.get_json(&format!("{DERIBIT}/get_book_summary_by_currency?currency=ETH&kind=option"), &[]).await?;
     let Some(rows) = v["result"].as_array() else { bail!("deribit options: unexpected reply") };
     let hour = ts / 3600 * 3600;
-    let tx = store.db.unchecked_transaction()?;
+    let tx = store.write_tx()?;
     let mut n = 0;
     for r in rows {
         let Some(name) = r["instrument_name"].as_str() else { continue };
@@ -245,7 +245,7 @@ pub async fn options(web: &Web, store: &Store, ts: i64) -> Result<usize> {
 pub async fn pool_yields(web: &Web, store: &Store, ts: i64) -> Result<usize> {
     let v = web.get_json("https://yields.llama.fi/pools", &[]).await?;
     let Some(rows) = v["data"].as_array() else { bail!("defillama: unexpected reply") };
-    let tx = store.db.unchecked_transaction()?;
+    let tx = store.write_tx()?;
     let mut n = 0;
     for p in rows {
         let project = p["project"].as_str().unwrap_or_default();

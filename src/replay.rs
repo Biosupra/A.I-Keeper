@@ -173,6 +173,9 @@ pub fn forecasts(store: &Store, from: i64, to: i64, now: i64) -> Result<Forecast
         in_tx += 1;
         if in_tx >= 100 {
             tx.commit()?;
+            // Let the daemon's own writers in: a writer that re-takes the lock at once after every
+            // commit starves them (SQLite's busy handler only polls).
+            std::thread::sleep(std::time::Duration::from_millis(100));
             tx = store.write_tx()?;
             in_tx = 0;
         }
@@ -326,6 +329,7 @@ pub fn days(store: &Store, from: i64, to: i64, now: i64, vault: &str) -> Result<
             )?;
         }
         tx.commit()?;
+        std::thread::sleep(std::time::Duration::from_millis(50));
         if !rows.is_empty() {
             out.days += 1;
             out.rows += rows.len();
