@@ -356,12 +356,23 @@ pub async fn poll(rpc: &Rpc, store: &Store, pool: &str, gauge: &str, max_chunks:
     Ok(s)
 }
 
-/// One-time history: every range in [from, to] not archived yet, paced for the public node.
+/// A node refusing the range because it is too wide for it ("eth_getLogs is limited to a 500
+/// range", "block range too large", "query returned more than N results"), as against a node that
+/// is down or behind.
+fn range_too_wide(err: &anyhow::Error) -> bool {
+    let m = format!("{err:#}").to_lowercase();
+    m.contains("limited to") || m.contains("block range") || m.contains("too many") || m.contains("-32614") || m.contains("exceed")
+}
+
+/// One-time history: every range in [from, to] not archived yet, paced for the public node. A node
+/// that caps eth_getLogs below SPAN narrows the range for the rest of the run (until 2026-10-07 the
+/// backfill stopped at the first such refusal, at block 51,207,242, on every run).
 pub async fn backfill(rpc: &Rpc, store: &Store, pool: &str, gauge: &str, from: i64, to: i64) -> Result<Summary> {
     let mut s = Summary { to: from - 1, ..Default::default() };
     let mut b = from;
+    let mut span = SPAN;
     while b <= to {
-        let mut e = (b + SPAN - 1).min(to);
+        let mut e = (b + span - 1).min(to);
         // Stop short of anything already archived (the live cursor's ranges), then skip past it.
         let next: Option<(i64, i64)> = store
             .db
@@ -380,6 +391,11 @@ pub async fn backfill(rpc: &Rpc, store: &Store, pool: &str, gauge: &str, from: i
         }
         let (logs, to_ts) = match fetch(rpc, pool, gauge, b, e).await {
             Ok(x) => x,
+            Err(err) if range_too_wide(&err) && e > b => {
+                span = ((e - b + 1) / 2).max(1);
+                tracing::info!("flow backfill: the node refused {} blocks ({err:#}); ranges narrowed to {span} blocks", e - b + 1);
+                continue;
+            }
             Err(err) => bail!("backfill stopped at block {b} ({err:#}); run it again to continue"),
         };
         let p = process(store, pool, gauge, b, e, to_ts, &logs)?;

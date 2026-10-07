@@ -263,6 +263,15 @@ impl Store {
         Ok(Store { db })
     }
 
+    /// A write transaction that takes the write lock at BEGIN (IMMEDIATE). A deferred transaction
+    /// that reads first and writes later fails with "cannot promote read transaction to write
+    /// transaction" the moment another connection (the daemon's other thread, or a manual command)
+    /// writes in between; this one waits for the lock instead (busy_timeout above) and can never be
+    /// overtaken. Use it for every job that reads and writes in one transaction.
+    pub fn write_tx(&self) -> Result<rusqlite::Transaction<'_>> {
+        Ok(rusqlite::Transaction::new_unchecked(&self.db, rusqlite::TransactionBehavior::Immediate)?)
+    }
+
     #[cfg(test)]
     pub fn memory() -> Result<Self> {
         let db = Connection::open_in_memory()?;

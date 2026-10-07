@@ -87,7 +87,11 @@ pub fn forecasts(store: &Store, from: i64, to: i64, now: i64) -> Result<Forecast
     // Graded 24 h forecasts become usable by the blend only once their outcome is known.
     let mut pending: VecDeque<(i64, &'static str, i64, f64)> = VecDeque::new(); // (target, model, made, score)
     let mut known: HashMap<&'static str, VecDeque<(i64, f64)>> = HashMap::new(); // model -> (made, score)
-    let mut tx = store.db.unchecked_transaction()?;
+
+    // IMMEDIATE transactions in short batches: the lock is held for well under a second at a time,
+    // and a read inside the batch can never be overtaken by the daemon's other connection (the
+    // "cannot promote read transaction" error that ended every replay before 2026-10-07).
+    let mut tx = store.write_tx()?;
     let mut in_tx = 0;
     let mut h = start;
     while h <= to {
@@ -167,9 +171,9 @@ pub fn forecasts(store: &Store, from: i64, to: i64, now: i64) -> Result<Forecast
         }
         out.hours += 1;
         in_tx += 1;
-        if in_tx >= 500 {
+        if in_tx >= 100 {
             tx.commit()?;
-            tx = store.db.unchecked_transaction()?;
+            tx = store.write_tx()?;
             in_tx = 0;
         }
         h += 3600;
@@ -310,7 +314,7 @@ pub fn days(store: &Store, from: i64, to: i64, now: i64, vault: &str) -> Result<
                 }
             }
         }
-        let tx = store.db.unchecked_transaction()?;
+        let tx = store.write_tx()?;
         for (strategy, r) in &rows {
             tx.execute(
                 "INSERT OR REPLACE INTO replay_day (day, strategy, net_per_day, revenue, costs, divergence, rebalances, recuts, held_out_minutes, in_range, day_vol, prior_vol)
@@ -340,21 +344,36 @@ pub fn days(store: &Store, from: i64, to: i64, now: i64, vault: &str) -> Result<
 pub const VERSION: &str = "1";
 
 /// Both replays over the last `days_back` days (each hour and day only once), or over all history
-/// when the replay's VERSION changed. The day replay needs a keeper width table; without the keeper
-/// bucket it is skipped and says so.
+/// until a full-history run has completed for this VERSION. The day replay needs a keeper width
+/// table; without the keeper bucket it is skipped and says so.
+///
+/// Two stamps make an interrupted rebuild RESUME instead of starting over: `replay_version` is
+/// written right after the older replayed rows are cleared (so the wipe happens once per VERSION),
+/// and `replay_complete` only once a full-history run has finished (until then every run covers
+/// all history, skipping whatever is already held). Before 2026-10-07 the single stamp was written
+/// only at the end, so each failed run wiped everything and began again from 2023, and the replay
+/// never got past September 2024.
 pub fn run(store: &Store, now: i64, days_back: i64, vault: &str) -> Result<String> {
     let first: Option<i64> = store.db.query_row("SELECT MIN(ts) FROM price_1m WHERE source = 'coinbase'", [], |r| r.get(0))?;
     let Some(first) = first else { bail!("no Coinbase history yet (run `aikeeper backfill` first)") };
     let mut days_back = days_back;
     let mut out = String::new();
     if store.meta_get("replay_version")?.as_deref() != Some(VERSION) {
-        let tx = store.db.unchecked_transaction()?;
+        let tx = store.write_tx()?;
         let n = tx.execute("DELETE FROM predictions WHERE replay = 1", [])?;
         tx.execute("DELETE FROM replay_day", [])?;
         tx.execute("DELETE FROM replay_runs", [])?;
+        tx.execute("DELETE FROM meta WHERE k = 'replay_complete'", [])?;
         tx.commit()?;
-        days_back = (now - first) / 86_400 + 1;
+        store.meta_set("replay_version", VERSION)?;
         out = format!("replay v{VERSION}: {n} older replayed forecasts cleared, replaying all history; ");
+    }
+    let complete = store.meta_get("replay_complete")?.as_deref() == Some(VERSION);
+    if !complete {
+        days_back = (now - first) / 86_400 + 1;
+        if out.is_empty() {
+            out = format!("replay v{VERSION}: history not complete yet, resuming (what is held is skipped); ");
+        }
     }
     // Forecasts need 30 days of history behind them.
     let from = (now - days_back * 86_400).max(first + 30 * 86_400);
@@ -364,8 +383,10 @@ pub fn run(store: &Store, now: i64, days_back: i64, vault: &str) -> Result<Strin
         Ok(d) => out += &format!("; days: {} replayed ({} strategy rows)", d.days, d.rows),
         Err(e) => out += &format!("; days: skipped ({e:#})"),
     }
-    // Stamped only once the forecasts are complete: an interrupted rebuild starts over.
-    store.meta_set("replay_version", VERSION)?;
+    if !complete {
+        store.meta_set("replay_complete", VERSION)?;
+        out += "; history complete";
+    }
     Ok(out)
 }
 

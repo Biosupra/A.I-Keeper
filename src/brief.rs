@@ -15,6 +15,7 @@ use crate::alerts::vault_name;
 use crate::collect::bucket::OLD;
 use crate::config::{Config, Email};
 use crate::registry;
+use crate::rules;
 use crate::store::Store;
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -727,6 +728,9 @@ pub fn build(store: &Store, now: i64, primary: &str) -> Result<(String, String)>
         )?;
     }
 
+    // ---------- 4b. the keeper-rules scoreboard, and whether the keeper's own scoring is right ----------
+    rules_plain(&mut b, store, now, 30, primary)?;
+
     // ---------- 5. is everything working ----------
     writeln!(b, "\nIS EVERYTHING WORKING?")?;
     let pool_n = store.count("SELECT COUNT(*) FROM pool_obs WHERE ts > ?1", &[&since])?;
@@ -1023,6 +1027,8 @@ fn technical(
         writeln!(b, "  {} UTC: keeper ±{:.1}%, A.I ±{:.1}%", hm(t), k as f64 * 0.5, a as f64 * 0.5)?;
     }
 
+    rules_technical(b, store, now, 30, primary)?;
+
     writeln!(b, "\nFORECAST SCORECARD (30 days; lower is better)")?;
     let (lines, _) = registry::scorecard(store, now, 30)?;
     if lines.is_empty() {
@@ -1114,6 +1120,168 @@ fn technical(
     Ok(())
 }
 
+/// "+$0.59" / "−$0.59".
+fn signed_money(x: f64) -> String {
+    let s = money(x.abs());
+    if x < 0.0 {
+        format!("−{s}")
+    } else {
+        format!("+{s}")
+    }
+}
+
+/// The keeper-rules scoreboard and the keeper's own scoring, in plain words (owner 2026-10-07: every
+/// change to the keeper is measured here first and ships only after ~30 days ahead).
+fn rules_plain(b: &mut String, store: &Store, now: i64, days: i64, primary: &str) -> Result<()> {
+    writeln!(b, "\nKEEPER RULES SCOREBOARD (last {days} days)")?;
+    writeln!(
+        b,
+        "  Every way of choosing a range width, scored on what it really would have made over the next 24 hours under the keeper's exact rules, on the real prices. The keeper's own choices are the line to beat."
+    )?;
+    match rules::scoreboard(store, now, days, primary)? {
+        None => writeln!(b, "  Nothing graded yet: each decision needs a full day of prices after it.")?,
+        Some(sb) => scoreboard_lines(b, &sb)?,
+    }
+    calibration_plain(b, store, now, days, primary)
+}
+
+/// The scoreboard's lines, its leader and the verdict.
+fn scoreboard_lines(b: &mut String, sb: &rules::Scoreboard) -> Result<()> {
+    writeln!(b, "  {} decisions over {}, per $1,000 a day:", commas(sb.hours as f64), plural(sb.days, "day", "days"))?;
+    for l in &sb.lines {
+        let tail = match l.key.as_str() {
+            "keeper" | "hindsight" => String::new(),
+            _ => format!("  ({} vs the keeper; ahead on {} of {} days)", signed_money(l.vs_keeper * 1000.0), l.days_ahead, l.days),
+        };
+        writeln!(b, "    {:<48} {:>7}{tail}", l.name, signed_money(l.mean * 1000.0))?;
+    }
+    let leader = sb.lines.iter().find(|l| l.key != "keeper" && l.key != "hindsight");
+    match leader {
+        Some(l) if l.vs_keeper > 0.0 => {
+            writeln!(
+                b,
+                "  Leader: \"{}\", ahead of the keeper by {} a day on $1,000 (90% range {} to {}).",
+                l.name,
+                money(l.vs_keeper * 1000.0),
+                signed_money(l.ci.0 * 1000.0),
+                signed_money(l.ci.1 * 1000.0)
+            )?;
+            if l.days < rules::EVIDENCE_DAYS {
+                writeln!(
+                    b,
+                    "  Verdict: only {} of evidence; I want {} days, including stormy ones, before suggesting any change to the keeper.",
+                    plural(l.days, "day", "days"),
+                    rules::EVIDENCE_DAYS
+                )?;
+            } else if l.ci.0 > 0.0 {
+                writeln!(b, "  Verdict: {}+ days and the lead holds at 90% confidence. This is worth a look.", rules::EVIDENCE_DAYS)?;
+            } else {
+                writeln!(b, "  Verdict: {}+ days, but the lead is inside the noise. No change.", rules::EVIDENCE_DAYS)?;
+            }
+        }
+        _ => writeln!(b, "  No candidate beat the keeper's own choices in this period.")?,
+    }
+    if sb.port_check.1 > 0 {
+        writeln!(
+            b,
+            "  Check: my copy of the keeper's choosing rule reproduced its recorded width in {} of {} hours.",
+            commas(sb.port_check.0 as f64),
+            commas(sb.port_check.1 as f64)
+        )?;
+    }
+    Ok(())
+}
+
+/// The keeper's predicted scores against what really happened, in plain words.
+fn calibration_plain(b: &mut String, store: &Store, now: i64, days: i64, primary: &str) -> Result<()> {
+    writeln!(b, "\nIS THE KEEPER'S SCORING RIGHT? (last {days} days)")?;
+    let g = rules::graded(store, now - days * 86_400, primary)?;
+    match rules::calibration(&g) {
+        Some(c) => {
+            writeln!(
+                b,
+                "  Before each decision the keeper predicts what every width will make over the next day. Predicted against what really happened, per $1,000 a day, over {}:",
+                plural(c.hours, "decision", "decisions")
+            )?;
+            for w in c.widths.iter().filter(|w| [2, 3, 4, 6, 8, 12, 16].contains(&w.h)) {
+                writeln!(
+                    b,
+                    "    ±{:<4} predicted {:>7}, really made {:>7}",
+                    format!("{}%", rules::describe(&format!("fixed:{}", w.h)).trim_start_matches("always ±").trim_end_matches('%')),
+                    signed_money(w.predicted * 1000.0),
+                    signed_money(w.realised * 1000.0)
+                )?;
+            }
+            let words = if c.rank_corr >= 0.5 {
+                "it ranked the widths about right"
+            } else if c.rank_corr >= 0.0 {
+                "its ranking of the widths had little to do with what happened"
+            } else {
+                "it preferred the widths that did worse: its ranking ran backwards"
+            };
+            writeln!(
+                b,
+                "  Its predicted best width was the real best in {} of {} decisions, and the order it put the widths in matched reality with a rank correlation of {:.2} (1 = right, 0 = none, below 0 = backwards): {words}.",
+                c.best_matched, c.hours, c.rank_corr
+            )?;
+        }
+        None => writeln!(b, "  No graded decision carries the keeper's table yet.")?,
+    }
+    Ok(())
+}
+
+/// The same, as numbers, for the technical detail.
+fn rules_technical(b: &mut String, store: &Store, now: i64, days: i64, primary: &str) -> Result<()> {
+    writeln!(b, "\nKEEPER RULES SCOREBOARD ({days} days; realised net %/day over the next 24 h, exact keeper rules; rules scored by the width they pick, held for the day)")?;
+    match rules::scoreboard(store, now, days, primary)? {
+        Some(sb) => {
+            writeln!(
+                b,
+                "  {} hours, {} days; keeper {} /day; rule port check {} of {}",
+                sb.hours,
+                sb.days,
+                pct(sb.keeper_mean),
+                sb.port_check.0,
+                sb.port_check.1
+            )?;
+            for l in &sb.lines {
+                writeln!(
+                    b,
+                    "  {:<12} {} /day · vs keeper {} [{}, {}] · ahead {} of {} days · n={}",
+                    l.key,
+                    pct(l.mean),
+                    pct(l.vs_keeper),
+                    pct(l.ci.0),
+                    pct(l.ci.1),
+                    l.days_ahead,
+                    l.days,
+                    l.hours
+                )?;
+            }
+        }
+        None => writeln!(b, "  nothing graded yet")?,
+    }
+    if let Some(c) = rules::calibration(&rules::graded(store, now - days * 86_400, primary)?) {
+        writeln!(
+            b,
+            "  Keeper score calibration: predicted vs realised %/day by half-width (h) over {} hours; mean Spearman {:.3}; predicted best = realised best in {}",
+            c.hours, c.rank_corr, c.best_matched
+        )?;
+        let cells: Vec<String> = c.widths.iter().map(|w| format!("h{} {}/{}", w.h, pct(w.predicted), pct(w.realised))).collect();
+        writeln!(b, "  {}", cells.join(" · "))?;
+    }
+    Ok(())
+}
+
+/// Both sections, for `aikeeper rules`.
+pub fn rules_report(store: &Store, now: i64, days: i64, primary: &str) -> Result<String> {
+    let mut b = String::new();
+    rules_plain(&mut b, store, now, days, primary)?;
+    writeln!(b)?;
+    rules_technical(&mut b, store, now, days, primary)?;
+    Ok(b)
+}
+
 pub async fn send(email: &Email, subject: &str, body: &str) -> Result<()> {
     use lettre::{
         message::header::ContentType, transport::smtp::authentication::Credentials, AsyncSmtpTransport, AsyncTransport, Message,
@@ -1160,6 +1328,12 @@ mod tests {
         let (subject, body) = build(&s, 1_790_700_000, PRIMARY_DEFAULT).unwrap();
         assert!(subject.contains("Panda daily") && subject.contains("all normal"), "{subject}");
         assert!(body.contains("I only watch and learn") && body.contains("THE SHORT VERSION") && body.contains("TECHNICAL DETAIL"));
+        assert!(
+            body.contains("KEEPER RULES SCOREBOARD")
+                && body.contains("Nothing graded yet")
+                && body.contains("IS THE KEEPER'S SCORING RIGHT?"),
+            "{body}"
+        );
         let ev = std::fs::read_to_string("tests/fixtures/position_events.json").unwrap();
         s.db.execute(
             "INSERT INTO keeper_rows (obj, line, tbl, ts, json, vault) VALUES ('o', 0, 'position_events', 1790679373, ?1, 'old')",
@@ -1194,5 +1368,8 @@ mod tests {
         assert_eq!(ago(3 * 3600 + 20 * 60), "3 h 20 min");
         assert_eq!(ago(36 * 3600), "36 h");
         assert_eq!(ago(3 * 86_400), "3 days");
+        assert_eq!(signed_money(0.59), "+$0.59");
+        assert_eq!(signed_money(-0.59), "−$0.59");
+        assert_eq!(signed_money(1234.5), "+$1,235");
     }
 }

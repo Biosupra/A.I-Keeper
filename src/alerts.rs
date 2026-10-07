@@ -5,8 +5,9 @@
 //! in the brief.
 //!
 //! What is watched (all read-only):
-//! * the live keeper's heartbeat: its signed deposit-width feed on the website (posted every
-//!   5 minutes) older than 30 minutes means the keeper process has stopped;
+//! * the live vault's keeper heartbeat: the signed deposit-width feed on the website (posted
+//!   every 5 minutes, by the new vault's keeper since 2026-10-07) older than 30 minutes means that
+//!   keeper process has stopped;
 //! * each keeper wallet's ETH on Base, which pays every rebalance's gas: the original vault's keeper
 //!   and the keeper of every vault of the multi-vault platform (read from the vault's `keeperBot()`);
 //! * the website: the home page and the Worker's health route failing twice in a row;

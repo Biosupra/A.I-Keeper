@@ -16,6 +16,7 @@ mod model;
 mod net;
 mod registry;
 mod replay;
+mod rules;
 mod run;
 mod store;
 
@@ -68,6 +69,12 @@ enum Cmd {
         #[arg(long, default_value_t = 30)]
         days: i64,
     },
+    /// Print the keeper-rules scoreboard: every way of choosing a width on what it really made over
+    /// the next 24 h (from the graded shadow hours), and the keeper's predicted vs realised scores.
+    Rules {
+        #[arg(long, default_value_t = 30)]
+        days: i64,
+    },
     /// Build today's brief; `--send` emails it (otherwise it is printed and written to disk).
     Brief {
         #[arg(long)]
@@ -99,6 +106,11 @@ async fn main() -> Result<()> {
         Cmd::Replay { days } => {
             let s = store::Store::open(&cfg.db_path())?;
             println!("{}", replay::run(&s, t, days, &cfg.primary_vault)?);
+            Ok(())
+        }
+        Cmd::Rules { days } => {
+            let s = store::Store::open(&cfg.db_path())?;
+            print!("{}", brief::rules_report(&s, t, days, &cfg.primary_vault)?);
             Ok(())
         }
         Cmd::Predict => {
