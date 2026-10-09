@@ -30,6 +30,11 @@ use std::time::Duration;
 
 /// Blocks per eth_getLogs (the public nodes' cap is 2,000).
 pub const SPAN: i64 = 1999;
+/// Blocks per eth_getLogs in the live reader. Smaller than SPAN so every endpoint in the list can
+/// answer: on 2026-10-08 the reader fell 45,000 blocks behind, where only Tenderly's gateway still
+/// serves logs and it caps a call at 1,000 blocks. In step it reads ~15 new blocks per cycle, so this
+/// only matters while catching up (3 calls a cycle = 1,500 blocks).
+pub const POLL_SPAN: i64 = 500;
 /// Blocks left unread at the head (Base reorgs are rare and shallow).
 const CONFIRMATIONS: i64 = 3;
 
@@ -343,7 +348,7 @@ pub async fn poll(rpc: &Rpc, store: &Store, pool: &str, gauge: &str, max_chunks:
         if cursor >= safe {
             break;
         }
-        let (from, to) = (cursor + 1, (cursor + SPAN).min(safe));
+        let (from, to) = (cursor + 1, (cursor + POLL_SPAN).min(safe));
         let (logs, to_ts) = fetch(rpc, pool, gauge, from, to).await?;
         let p = process(store, pool, gauge, from, to, to_ts, &logs)?;
         s.logs += p.logs;

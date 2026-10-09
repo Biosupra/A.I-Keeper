@@ -41,6 +41,10 @@ pub const ALLOWED_HOSTS: &[&str] = &[
     "mainnet.base.org",
     "base-rpc.publicnode.com",
     "base.drpc.org",
+    // The only free endpoint found (2026-10-09) that serves eth_getLogs more than ~10,000 blocks back
+    // (up to 1,000 blocks per call); the others refuse old ranges, so a reader that fell behind could
+    // never catch up.
+    "base.gateway.tenderly.co",
     // Market data (public, no key).
     "api.exchange.coinbase.com",
     "www.deribit.com",

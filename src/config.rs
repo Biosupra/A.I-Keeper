@@ -66,7 +66,9 @@ impl Config {
         Config {
             data_dir: var("AIK_DATA_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("data")),
             rpc_urls: var("AIK_RPC_URLS")
-                .unwrap_or_else(|| "https://mainnet.base.org,https://base-rpc.publicnode.com,https://base.drpc.org".into())
+                .unwrap_or_else(|| {
+                    "https://mainnet.base.org,https://base-rpc.publicnode.com,https://base.drpc.org,https://base.gateway.tenderly.co".into()
+                })
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
