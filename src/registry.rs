@@ -332,6 +332,41 @@ pub fn grade_shadow(store: &Store, made: i64) -> Result<Option<()>> {
     let keeper_hours = shadow::hours_for(&tables, None, &policy);
     let Some(keeper) = shadow::replay(&policy, &keeper_hours, &path, made, 86_400, None) else { return Ok(None) };
 
+    // The NEW rules (keeper WIDTH_MODE=regime) on the same window, in dollars, next to what the table
+    // rules did or would have done (`keeper` above). Scored whichever of the two the keeper runs.
+    let run: Option<Value> = store
+        .db
+        .query_row(
+            "SELECT json FROM keeper_rows WHERE tbl = 'keeper_runs' AND vault = ?2 AND ts <= ?1 ORDER BY ts DESC LIMIT 1",
+            params![made, vault],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    let rp = crate::model::regime::Params::from_keeper_run(run.as_ref());
+    let live_mode = run.as_ref().and_then(|r| r["policy"]["width_mode"].as_str()).unwrap_or("table").to_string();
+    let long_path = store.pool_path(made - rp.long_window_secs - 3600, end)?;
+    let vols = crate::model::regime::VolPath::new(&long_path);
+    if let Some(new) = crate::model::regime::replay(&rp, &policy, &keeper_hours, &path, &vols, made, 86_400) {
+        store.db.execute(
+            "INSERT OR REPLACE INTO rules_compare (made_ts, vault, live_mode, old_end, old_rewards, old_moves, old_in_range, new_end, new_rewards, new_moves, new_in_range)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                made,
+                vault,
+                live_mode,
+                keeper.usd_end,
+                keeper.usd_rewards,
+                keeper.rebalances + keeper.recuts,
+                keeper.in_range_fraction,
+                new.usd_end,
+                new.usd_rewards,
+                new.rebalances + new.recuts,
+                new.in_range_fraction
+            ],
+        )?;
+    }
+
     // Each model: its own volatility at each hour (from that hour's shadow_model row; an hour it
     // has no row for keeps its previous one).
     let models: Vec<String> = {

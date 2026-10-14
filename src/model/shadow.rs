@@ -305,6 +305,12 @@ impl Policy {
         set!(recut_narrow_margin, f64);
         set!(recut_narrow_floor_spacings, i64);
         set!(user_reward_share, f64);
+        // In WIDTH_MODE=regime the keeper logs the regime's 1 h confirmation and cooldown; the table rules
+        // it no longer runs had the compiled 6 h and 2 h, and that is what "the old rules" are replayed with.
+        if p["width_mode"].as_str() == Some("regime") {
+            out.confirmation_secs = 21_600;
+            out.cooldown_secs = 7_200;
+        }
         out
     }
 }
@@ -429,6 +435,28 @@ pub struct Replay {
     /// Every action taken: (time, "rebalance" or "recut", new width in spacings each side).
     #[serde(default)]
     pub actions: Vec<(i64, String, i64)>,
+    /// The same replay in DOLLARS (owner's measure, 2026-10-13): the position's balance at the end and
+    /// the rewards paid, both as a fraction of the dollars it started with. Unlike `divergence`, this
+    /// carries ETH's own price move, so two strategies compared on the same window face the same move.
+    #[serde(default)]
+    pub usd_end: f64,
+    #[serde(default)]
+    pub usd_rewards: f64,
+}
+
+/// Dollar value of one unit of liquidity on [lower, upper) at `tick` (token1 units x a constant; only
+/// ratios are used). Same closed form as `divergence_fraction`.
+pub fn value_per_l(tick: f64, lower: f64, upper: f64) -> f64 {
+    let sqrt_at = |t: f64| (t * LN_TICK / 2.0).exp();
+    let (sa, sb, s) = (sqrt_at(lower), sqrt_at(upper), sqrt_at(tick));
+    let (a0, a1) = if s <= sa {
+        ((sb - sa) / (sa * sb), 0.0)
+    } else if s < sb {
+        ((sb - s) / (s * sb), s - sa)
+    } else {
+        (0.0, sb - sa)
+    };
+    a0 * s * s + a1
 }
 
 /// Replays a $`table.position_usd` position under the keeper's rules on a one-minute path of
@@ -472,6 +500,8 @@ pub fn replay_from(
     }
     let mut value = 1.0f64; // fraction of the starting position
     let mut out = Replay::default();
+    // Dollars: one dollar to start, as liquidity on the starting range.
+    let mut liq = 1.0 / value_per_l(mint, lower, upper).max(1e-300);
     let mut outside_since: Option<i64> = None;
     let mut hold_since: Option<i64> = None;
     let mut recut_candidate: Option<(bool, i64)> = None;
@@ -501,7 +531,9 @@ pub fn replay_from(
         total_secs += dt;
         if tick >= lower && tick < upper {
             in_range_secs += dt;
-            out.revenue += row.gross_apr / (365.0 * 86_400.0) * p.user_reward_share * row.capture * dt as f64 * value;
+            let rate = row.gross_apr / (365.0 * 86_400.0) * p.user_reward_share * row.capture * dt as f64;
+            out.revenue += rate * value;
+            out.usd_rewards += rate * liq * value_per_l(tick, lower, upper);
         }
         // 5-minute TWAP of the minute ticks, needing half the window covered (keeper twap_tick).
         twap.push_back((t, tick));
@@ -627,9 +659,12 @@ pub fn replay_from(
             out.divergence += div;
             out.costs += cost;
             value -= div + cost;
+            let usd = liq * value_per_l(tick, lower, upper);
+            let usd_cost = usd * 0.5 * fee / 1e6 + if table.position_usd > 0.0 { table.gas_usd / table.position_usd } else { 0.0 };
             h = new_h;
             (lower, upper) = snap(tick, h);
             mint = tick;
+            liq = (usd - usd_cost).max(0.0) / value_per_l(tick, lower, upper).max(1e-300);
             last_rebalance = Some(t);
             recent.push_back(t);
             outside_since = None;
@@ -641,6 +676,7 @@ pub fn replay_from(
     // Mark the open range to market.
     if let Some(last) = window.last() {
         out.divergence += value * divergence_fraction(mint, last.1, lower, upper);
+        out.usd_end = liq * value_per_l(last.1, lower, upper);
     }
     out.in_range_fraction = if total_secs > 0 { in_range_secs as f64 / total_secs as f64 } else { 0.0 };
     out.net_per_day = (out.revenue - out.costs - out.divergence) / (secs as f64 / 86_400.0);

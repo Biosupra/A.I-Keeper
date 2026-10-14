@@ -75,6 +75,13 @@ enum Cmd {
         #[arg(long, default_value_t = 30)]
         days: i64,
     },
+    /// Re-grade the shadow hours of the last N days (fills `rules_compare`, the NEW vs OLD rules in
+    /// dollars, for hours graded before it existed). Grading is deterministic: other rows are rewritten
+    /// with the values they already have.
+    Regrade {
+        #[arg(long, default_value_t = 30)]
+        days: i64,
+    },
     /// Build today's brief; `--send` emails it (otherwise it is printed and written to disk).
     Brief {
         #[arg(long)]
@@ -111,6 +118,27 @@ async fn main() -> Result<()> {
         Cmd::Rules { days } => {
             let s = store::Store::open(&cfg.db_path())?;
             print!("{}", brief::rules_report(&s, t, days, &cfg.primary_vault)?);
+            Ok(())
+        }
+        Cmd::Regrade { days } => {
+            let s = store::Store::open_with_timeout(&cfg.db_path(), 300)?;
+            let made: Vec<i64> = {
+                let mut st = s.db.prepare("SELECT made_ts FROM shadow WHERE resolved_ts IS NOT NULL AND made_ts > ?1 ORDER BY made_ts")?;
+                let rows = st.query_map([t - days * 86_400], |r| r.get(0))?;
+                rows.collect::<std::result::Result<_, _>>()?
+            };
+            let mut graded = 0;
+            for m in &made {
+                if registry::grade_shadow(&s, *m)?.is_some() {
+                    graded += 1;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50)); // let the daemon write
+            }
+            println!(
+                "re-graded {graded} of {} shadow hours; rules_compare rows: {}",
+                made.len(),
+                s.count("SELECT COUNT(*) FROM rules_compare", &[])?
+            );
             Ok(())
         }
         Cmd::Predict => {

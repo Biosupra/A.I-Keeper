@@ -730,6 +730,7 @@ pub fn build(store: &Store, now: i64, primary: &str) -> Result<(String, String)>
 
     // ---------- 4b. the keeper-rules scoreboard, and whether the keeper's own scoring is right ----------
     rules_plain(&mut b, store, now, 30, primary)?;
+    rules_compare_plain(&mut b, store, now, primary)?;
 
     // ---------- 5. is everything working ----------
     writeln!(b, "\nIS EVERYTHING WORKING?")?;
@@ -1094,6 +1095,12 @@ fn technical(
         fid.clocks.0,
         fid.clocks.1
     )?;
+    if live_width_mode(store, primary) == "regime" {
+        writeln!(
+            b,
+            "  The keeper runs the NEW regime rules: the copy checked here is of the OLD table rules, so its rebalances are not expected to match (see NEW RULES vs OLD RULES)."
+        )?;
+    }
     match (&fid.rules_version, fid.rules_since) {
         (Some(v), Some(since_ts)) => writeln!(
             b,
@@ -1132,6 +1139,98 @@ fn signed_money(x: f64) -> String {
 
 /// The keeper-rules scoreboard and the keeper's own scoring, in plain words (owner 2026-10-07: every
 /// change to the keeper is measured here first and ships only after ~30 days ahead).
+/// Which width rules the vault's keeper runs now: "regime" (WIDTH_MODE=regime) or "table".
+pub fn live_width_mode(store: &Store, primary: &str) -> String {
+    store
+        .db
+        .query_row(
+            "SELECT json_extract(json, '$.policy.width_mode') FROM keeper_rows WHERE tbl = 'keeper_runs' AND vault = ?1 ORDER BY ts DESC LIMIT 1",
+            [primary],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "table".to_string())
+}
+
+/// A `rules_compare` row: made_ts, old end, old rewards, old moves, new end, new rewards, new moves.
+type CompareRow = (i64, f64, f64, f64, f64, f64, f64);
+
+/// NEW RULES vs OLD RULES: the keeper's regime rules and its table rules replayed on the same 24 h
+/// after every shadow hour, in dollars on $1,000 (balance + rewards), whichever one the keeper runs.
+fn rules_compare_plain(b: &mut String, store: &Store, now: i64, primary: &str) -> Result<()> {
+    let live = live_width_mode(store, primary);
+    writeln!(b, "\nNEW RULES vs OLD RULES (a $1,000 position, a day later on the real prices: balance + rewards)")?;
+    writeln!(
+        b,
+        "  The keeper runs the {} rules. Both sets are replayed on the same hours, so this shows what the {} rules would have done.",
+        if live == "regime" { "NEW (calm / moderate / volatile)" } else { "OLD (width table)" },
+        if live == "regime" { "old" } else { "new" }
+    )?;
+    let mut any = false;
+    for days in [7i64, 30] {
+        let rows: Vec<CompareRow> = {
+            let mut st = store.db.prepare(
+                "SELECT made_ts, old_end, old_rewards, old_moves, new_end, new_rewards, new_moves FROM rules_compare
+                 WHERE vault = ?1 AND made_ts > ?2 AND old_end > 0 AND new_end > 0 ORDER BY made_ts",
+            )?;
+            let it = st.query_map(rusqlite::params![primary, now - days * 86_400], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, f64>(3)?, r.get(4)?, r.get(5)?, r.get::<_, f64>(6)?))
+            })?;
+            it.collect::<std::result::Result<_, _>>()?
+        };
+        if rows.is_empty() {
+            continue;
+        }
+        any = true;
+        let n = rows.len() as f64;
+        let mean = |f: &dyn Fn(&CompareRow) -> f64| rows.iter().map(f).sum::<f64>() / n;
+        let new_total = mean(&|r| (r.4 + r.5 - 1.0) * 1000.0);
+        let old_total = mean(&|r| (r.1 + r.2 - 1.0) * 1000.0);
+        let mut by_day: std::collections::BTreeMap<i64, (f64, f64, f64)> = std::collections::BTreeMap::new();
+        for r in &rows {
+            let e = by_day.entry(r.0 / 86_400).or_insert((0.0, 0.0, 0.0));
+            e.0 += r.4 + r.5;
+            e.1 += r.1 + r.2;
+            e.2 += 1.0;
+        }
+        let ahead = by_day.values().filter(|d| d.0 > d.1).count();
+        writeln!(
+            b,
+            "  Last {days} days ({} hours checked): NEW rules {} (rewards {}, {:.1} moves a day) | OLD rules {} (rewards {}, {:.1} moves a day). The new rules were ahead on {ahead} of {} days.",
+            rows.len(),
+            signed_usd(new_total),
+            usd2(mean(&|r| r.5 * 1000.0)),
+            mean(&|r| r.6),
+            signed_usd(old_total),
+            usd2(mean(&|r| r.2 * 1000.0)),
+            mean(&|r| r.3),
+            by_day.len()
+        )?;
+    }
+    if !any {
+        writeln!(b, "  Nothing scored yet: the first hours are graded a day after they are made.")?;
+    } else {
+        writeln!(
+            b,
+            "  Each figure is the change on $1,000 over the following 24 h, ETH's own price move included (it is the same for both)."
+        )?;
+    }
+    Ok(())
+}
+
+fn signed_usd(x: f64) -> String {
+    if x < 0.0 {
+        format!("-${:.2}", -x)
+    } else {
+        format!("+${x:.2}")
+    }
+}
+
+fn usd2(x: f64) -> String {
+    format!("${x:.2}")
+}
+
 fn rules_plain(b: &mut String, store: &Store, now: i64, days: i64, primary: &str) -> Result<()> {
     writeln!(b, "\nKEEPER RULES SCOREBOARD (last {days} days)")?;
     writeln!(

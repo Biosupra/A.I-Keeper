@@ -197,6 +197,15 @@ CREATE TABLE IF NOT EXISTS replay_day (
   PRIMARY KEY (day, strategy)
 );
 CREATE TABLE IF NOT EXISTS replay_runs (ts INTEGER PRIMARY KEY, kind TEXT NOT NULL, assumptions TEXT NOT NULL);
+
+-- The keeper's NEW rules (WIDTH_MODE=regime) against its OLD table rules on the same 24 h after each
+-- shadow hour, in dollars: balance and rewards as fractions of the starting dollars (model/regime.rs).
+-- `live_mode` = which of the two the keeper actually ran then.
+CREATE TABLE IF NOT EXISTS rules_compare (
+  made_ts INTEGER PRIMARY KEY, vault TEXT, live_mode TEXT,
+  old_end REAL, old_rewards REAL, old_moves INTEGER, old_in_range REAL,
+  new_end REAL, new_rewards REAL, new_moves INTEGER, new_in_range REAL
+);
 "#;
 
 /// Columns added after a database may already exist on disk (CREATE TABLE IF NOT EXISTS does not
