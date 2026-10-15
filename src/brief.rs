@@ -731,6 +731,7 @@ pub fn build(store: &Store, now: i64, primary: &str) -> Result<(String, String)>
     // ---------- 4b. the keeper-rules scoreboard, and whether the keeper's own scoring is right ----------
     rules_plain(&mut b, store, now, 30, primary)?;
     rules_compare_plain(&mut b, store, now, primary)?;
+    crash_wait_plain(&mut b, store, now, primary)?;
 
     // ---------- 5. is everything working ----------
     writeln!(b, "\nIS EVERYTHING WORKING?")?;
@@ -1219,6 +1220,70 @@ fn rules_compare_plain(b: &mut String, store: &Store, now: i64, primary: &str) -
     Ok(())
 }
 
+/// CRASH WAIT: is the regime mode's "wait for the bottom / top" actually firing? The old crash hold-out
+/// passed every test and then armed on 0% of tables for three weeks before anyone counted (2026-10-13),
+/// so this counts the holds the keeper logged, and says so loudly when positions left their range and
+/// nothing was held. Only written while the keeper runs the regime rules.
+fn crash_wait_plain(b: &mut String, store: &Store, now: i64, primary: &str) -> Result<()> {
+    if live_width_mode(store, primary) != "regime" {
+        return Ok(());
+    }
+    writeln!(b, "\nCRASH WAIT (the new rules' hold while ETH keeps making new lows or highs)")?;
+    const HOLD: &str = "decision = 'holding' AND (reason LIKE 'wait for the bottom%' OR reason LIKE 'wait for the top%')";
+    for days in [7i64, 30] {
+        let since = now - days * 86_400;
+        let holds =
+            store.count(&format!("SELECT COUNT(*) FROM decision_min WHERE vault = ?1 AND ts > ?2 AND {HOLD}"), &[&primary, &since])?;
+        let held_positions = store.count(
+            &format!("SELECT COUNT(DISTINCT token_id) FROM decision_min WHERE vault = ?1 AND ts > ?2 AND {HOLD}"),
+            &[&primary, &since],
+        )?;
+        let bottoms = store.count(
+            &format!("SELECT COUNT(DISTINCT token_id) FROM decision_min WHERE vault = ?1 AND ts > ?2 AND {HOLD} AND reason LIKE 'wait for the bottom%'"),
+            &[&primary, &since],
+        )?;
+        let reopened = store.count(
+            "SELECT COUNT(*) FROM decision_min WHERE vault = ?1 AND ts > ?2 AND decision = 'rebalance' AND COALESCE(outside_secs, 0) > 0",
+            &[&primary, &since],
+        )?;
+        let last: Option<i64> = store.db.query_row(
+            &format!("SELECT MAX(ts) FROM decision_min WHERE vault = ?1 AND ts > ?2 AND {HOLD}"),
+            rusqlite::params![primary, since],
+            |r| r.get(0),
+        )?;
+        let longest: Option<i64> = store.db.query_row(
+            &format!("SELECT MAX(outside_secs) FROM decision_min WHERE vault = ?1 AND ts > ?2 AND {HOLD}"),
+            rusqlite::params![primary, since],
+            |r| r.get(0),
+        )?;
+        let mut line = format!(
+            "  Last {days} days: {} held ({} waiting for a bottom, {} for a top) over {} heartbeats; {} re-opened after leaving range",
+            plural(held_positions, "position", "positions"),
+            bottoms,
+            held_positions - bottoms,
+            commas(holds as f64),
+            plural(reopened, "position was", "positions were"),
+        );
+        if let Some(t) = last {
+            line.push_str(&format!("; last hold {}", ago(now - t)));
+        }
+        if let Some(secs) = longest.filter(|s| *s > 0) {
+            line.push_str(&format!("; longest wait {} h", secs / 3600));
+        }
+        line.push('.');
+        writeln!(b, "{line}")?;
+        if holds == 0 && reopened >= 3 {
+            writeln!(
+                b,
+                "  WARNING: {} re-opened out of range in {days} days and the hold never fired once. That is how the old crash hold-out failed. Check the keeper's REGIME_STABLE_SECS / REGIME_MAX_WAIT_SECS and its decision log.",
+                plural(reopened, "position", "positions")
+            )?;
+        }
+    }
+    writeln!(b, "  A hold is right when ETH kept falling after it; wrong when ETH came back inside the range anyway (the position earned nothing while held).")?;
+    Ok(())
+}
+
 fn signed_usd(x: f64) -> String {
     if x < 0.0 {
         format!("-${:.2}", -x)
@@ -1444,6 +1509,55 @@ mod tests {
         assert!(body.contains("The original vault") && body.contains("1 new deposit ($23.07)"), "{body}");
         assert!(body.contains("deposits 1 ($23.07)"), "technical detail keeps the raw counts: {body}");
         assert!(body.contains("too narrow today"));
+    }
+
+    #[test]
+    fn crash_wait_counts_the_regime_holds_and_warns_when_none_fired() {
+        let s = Store::memory().unwrap();
+        let now = 1_790_700_000i64;
+        let (_, body) = build(&s, now, PRIMARY_DEFAULT).unwrap();
+        assert!(!body.contains("CRASH WAIT"), "table mode: no section");
+        s.db.execute(
+            "INSERT INTO keeper_rows (obj, line, tbl, ts, json, vault) VALUES ('r', 0, 'keeper_runs', ?1, '{\"policy\":{\"width_mode\":\"regime\"}}', ?2)",
+            rusqlite::params![now - 3600, PRIMARY_DEFAULT],
+        )
+        .unwrap();
+        // Three positions re-opened from out of range, no hold ever logged: the failure this section exists to catch.
+        for (id, ts) in [(1, now - 7200), (2, now - 5400), (3, now - 3600)] {
+            s.db.execute(
+                "INSERT INTO decision_min (token_id, ts, decision, reason, outside_secs, vault) VALUES (?1, ?2, 'rebalance', 'range exit confirmed', 21600, ?3)",
+                rusqlite::params![id, ts, PRIMARY_DEFAULT],
+            )
+            .unwrap();
+        }
+        let (_, body) = build(&s, now, PRIMARY_DEFAULT).unwrap();
+        assert!(body.contains("CRASH WAIT"), "{body}");
+        assert!(
+            body.contains(
+                "0 positions held (0 waiting for a bottom, 0 for a top) over 0 heartbeats; 3 positions were re-opened after leaving range."
+            ),
+            "{body}"
+        );
+        assert!(body.contains("WARNING: 3 positions re-opened out of range in 7 days and the hold never fired once"), "{body}");
+        // The hold fires: counted per position, bottoms and tops apart, with the longest wait.
+        for (ts, reason, secs) in [
+            (now - 3000, "wait for the bottom: ETH made a new low 10s ago; re-opening after 6h00m00s without one (out of range 2h00m00s of max 24h00m00s)", 7200),
+            (now - 2400, "wait for the bottom: ETH made a new low 5m00s ago; re-opening after 6h00m00s without one (out of range 2h10m00s of max 24h00m00s)", 7800),
+        ] {
+            s.db.execute(
+                "INSERT INTO decision_min (token_id, ts, decision, reason, outside_secs, vault) VALUES (7, ?1, 'holding', ?2, ?3, ?4)",
+                rusqlite::params![ts, reason, secs, PRIMARY_DEFAULT],
+            )
+            .unwrap();
+        }
+        s.db.execute(
+            "INSERT INTO decision_min (token_id, ts, decision, reason, outside_secs, vault) VALUES (8, ?1, 'holding', 'wait for the top: ETH made a new high 1m00s ago; re-opening after 6h00m00s without one (out of range 30m00s of max 24h00m00s)', 1800, ?2)",
+            rusqlite::params![now - 600, PRIMARY_DEFAULT],
+        )
+        .unwrap();
+        let (_, body) = build(&s, now, PRIMARY_DEFAULT).unwrap();
+        assert!(body.contains("2 positions held (1 waiting for a bottom, 1 for a top) over 3 heartbeats; 3 positions were re-opened after leaving range; last hold 10 min; longest wait 2 h."), "{body}");
+        assert!(!body.contains("WARNING: 3 positions re-opened"), "{body}");
     }
 
     #[test]
