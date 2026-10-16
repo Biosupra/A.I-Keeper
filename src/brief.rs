@@ -1229,7 +1229,7 @@ fn crash_wait_plain(b: &mut String, store: &Store, now: i64, primary: &str) -> R
         return Ok(());
     }
     writeln!(b, "\nCRASH WAIT (the new rules' hold while ETH keeps making new lows or highs)")?;
-    const HOLD: &str = "decision = 'holding' AND (reason LIKE 'wait for the bottom%' OR reason LIKE 'wait for the top%')";
+    const HOLD: &str = "decision = 'holding' AND (reason LIKE 'wait for the bottom%' OR reason LIKE 'wait for the top%' OR reason LIKE 'waiting for the price to come back%')";
     for days in [7i64, 30] {
         let since = now - days * 86_400;
         let holds =
@@ -1269,6 +1269,16 @@ fn crash_wait_plain(b: &mut String, store: &Store, now: i64, primary: &str) -> R
         }
         if let Some(secs) = longest.filter(|s| *s > 0) {
             line.push_str(&format!("; longest wait {} h", secs / 3600));
+        }
+        let returns = store.count(
+            "SELECT COUNT(DISTINCT token_id) FROM decision_min WHERE vault = ?1 AND ts > ?2 AND decision = 'holding' AND reason LIKE 'waiting for the price to come back%'",
+            &[&primary, &since],
+        )?;
+        if returns > 0 {
+            line.push_str(&format!(
+                "; {} held for the price to come back (the 7-day rule)",
+                plural(returns, "position was", "positions were")
+            ));
         }
         line.push('.');
         writeln!(b, "{line}")?;

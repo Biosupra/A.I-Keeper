@@ -31,6 +31,9 @@ pub struct Params {
     pub widen_margin: f64,
     pub confirmation_secs: i64,
     pub cooldown_secs: i64,
+    /// A fall out of range is held this long for the price to come back before the bottom rule may
+    /// re-open it (keeper REGIME_RETURN_WAIT_SECS; 0 = off). Every fall; rises are never held this way.
+    pub return_wait_secs: i64,
 }
 
 impl Default for Params {
@@ -50,6 +53,7 @@ impl Default for Params {
             widen_margin: 0.0004,
             confirmation_secs: 3_600,
             cooldown_secs: 3_600,
+            return_wait_secs: 604_800,
         }
     }
 }
@@ -78,6 +82,7 @@ impl Params {
         out.widen_after_secs = i("widen_after_secs", out.widen_after_secs);
         out.narrow_after_secs = i("narrow_after_secs", out.narrow_after_secs);
         out.widen_margin = f("widen_margin", out.widen_margin);
+        out.return_wait_secs = i("return_wait_secs", out.return_wait_secs);
         out.confirmation_secs = p["confirmation_secs"].as_i64().unwrap_or(out.confirmation_secs);
         out.cooldown_secs = p["cooldown_secs"].as_i64().unwrap_or(out.cooldown_secs);
         out
@@ -267,7 +272,14 @@ pub fn replay(
             if t - out_since >= rp.confirmation_secs && paced {
                 let held = t - *hold_since.get_or_insert(t);
                 let fee_or_deviation = fee > p.fee_hold_pips || (tick - tw).abs() > p.max_twap_deviation_ticks;
-                let still_moving = t - out_since < rp.max_wait_secs && extreme.is_some_and(|e| t - e.2 < rp.stable_secs);
+                // A fall is first held for the price to come back (the owner's 7-day rule); the bottom
+                // rule and its cap count from the end of that wait. Rises are not held this way.
+                let return_wait = match extreme {
+                    Some((true, _, _)) if rp.return_wait_secs > 0 => rp.return_wait_secs,
+                    _ => 0,
+                };
+                let still_moving = t - out_since < return_wait
+                    || (t - out_since < return_wait + rp.max_wait_secs && extreme.is_some_and(|e| t - e.2 < rp.stable_secs));
                 let blocked = still_moving || (held < p.hold_max_secs && fee_or_deviation);
                 if !blocked {
                     act = Some((reading(t, 0.0), "rebalance"));
@@ -353,7 +365,7 @@ mod tests {
 
     #[test]
     fn a_fall_waits_for_the_bottom_then_reopens() {
-        let rp = Params::default();
+        let rp = Params { return_wait_secs: 0, ..Params::default() };
         let p = Policy::default();
         let t0 = 20_000_000;
         let mut path = quiet(t0 - 80 * 3600, 80 * 60, -197_000.0);
@@ -366,6 +378,56 @@ mod tests {
         let first = r.actions.iter().find(|a| a.1 == "rebalance").expect("re-opened");
         assert!(first.0 >= t0 + 240 * 60 + 21_600 - 60, "re-opened only 6 h after the last new low ({})", first.0 - t0);
         assert!(r.held_out_minutes > 0);
+    }
+
+    #[test]
+    fn a_fall_is_held_for_the_price_to_come_back_and_a_rise_is_not() {
+        let rp = Params::default(); // 7-day return wait
+        let p = Policy::default();
+        let t0 = 20_000_000;
+        // The same fall as above: no re-open inside the first day (the week-long wait), and it is held.
+        let mut path = quiet(t0 - 80 * 3600, 80 * 60, -197_000.0);
+        for i in 0..(24 * 60) {
+            let x = if i < 240 { -197_000.0 - 2.5 * i as f64 } else { -197_600.0 + (i % 2) as f64 };
+            path.push((t0 + i * 60, x, Some(400.0)));
+        }
+        let r = replay(&rp, &p, &hours(t0 - 3600), &path, &VolPath::new(&path), t0, 24 * 3600).unwrap();
+        assert!(!r.actions.iter().any(|a| a.1 == "rebalance"), "held for the return: {:?}", r.actions);
+        assert!(r.held_out_minutes > 0);
+        // The price comes back into the range on day two: still no rebalance, and it is earning again.
+        let mut back = quiet(t0 - 80 * 3600, 80 * 60, -197_000.0);
+        for i in 0..(48 * 60) {
+            let x = if i < 240 {
+                -197_000.0 - 2.5 * i as f64
+            } else if i < 24 * 60 {
+                -197_600.0 + (i % 2) as f64
+            } else if i < 24 * 60 + 240 {
+                -197_600.0 + 2.5 * (i - 24 * 60) as f64
+            } else {
+                -197_000.0 + (i % 2) as f64
+            };
+            back.push((t0 + i * 60, x, Some(400.0)));
+        }
+        let r2 = replay(&rp, &p, &hours(t0 - 3600), &back, &VolPath::new(&back), t0, 48 * 3600).unwrap();
+        assert!(!r2.actions.iter().any(|a| a.1 == "rebalance"), "came back: nothing to re-open: {:?}", r2.actions);
+        assert!(
+            r2.in_range_fraction > 0.45 && r2.in_range_fraction < 0.6,
+            "earning before the fall and after the return ({})",
+            r2.in_range_fraction
+        );
+        // A RISE of the same size re-opens after six quiet hours, as before.
+        let mut rise = quiet(t0 - 80 * 3600, 80 * 60, -197_000.0);
+        for i in 0..(20 * 60) {
+            let x = if i < 240 { -197_000.0 + 2.5 * i as f64 } else { -196_400.0 - (i % 2) as f64 };
+            rise.push((t0 + i * 60, x, Some(400.0)));
+        }
+        let r3 = replay(&rp, &p, &hours(t0 - 3600), &rise, &VolPath::new(&rise), t0, 20 * 3600).unwrap();
+        let first = r3.actions.iter().find(|a| a.1 == "rebalance").expect("a rise re-opens");
+        assert!(
+            first.0 >= t0 + 240 * 60 + 21_600 - 60 && first.0 < t0 + 240 * 60 + 21_600 + 1800,
+            "six quiet hours after the top ({})",
+            first.0 - t0
+        );
     }
 
     #[test]
