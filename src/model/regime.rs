@@ -433,9 +433,16 @@ mod tests {
     #[test]
     fn regime_settings_come_from_the_keeper_only_in_regime_mode() {
         let run = serde_json::json!({"policy": {"width_mode": "regime", "confirmation_secs": 3600, "cooldown_secs": 3600,
-            "regime": {"busy_vol": 0.006, "wide_half_spacings": 18}}});
+            "regime": {"busy_vol": 0.006, "wide_half_spacings": 18, "return_wait_secs": 259200}}});
         let p = Params::from_keeper_run(Some(&run));
         assert_eq!((p.busy_vol, p.wide, p.calm_vol), (0.006, 18, 0.0043));
+        assert_eq!(p.return_wait_secs, 259_200, "the return wait is read from the keeper's run row");
+        let no_wait = serde_json::json!({"policy": {"width_mode": "regime", "regime": {}}});
+        assert_eq!(
+            Params::from_keeper_run(Some(&no_wait)).return_wait_secs,
+            604_800,
+            "a keeper that does not log it yet gets the 7-day default"
+        );
         let table_mode = serde_json::json!({"policy": {"width_mode": "table", "regime": {"busy_vol": 0.9}}});
         assert_eq!(Params::from_keeper_run(Some(&table_mode)), Params::default());
         // And the OLD rules keep their own timers when the keeper logs the regime's.
