@@ -77,8 +77,11 @@ fn web_client_has_no_write_verbs() {
     for verb in [".put(", ".delete(", ".patch("] {
         assert!(!net.contains(verb), "src/net.rs must not expose {verb}");
     }
-    // The single POST is the JSON-RPC client, and every method it carries passes the allowlist.
-    assert_eq!(net.matches(".post(").count(), 1, "exactly one POST (JSON-RPC) is allowed");
+    // Two POSTs: the JSON-RPC client, whose every method passes the allowlist, and the Claude client,
+    // which sends only to the Messages URL and never offers tools.
+    assert_eq!(net.matches(".post(").count(), 2, "exactly two POSTs (JSON-RPC and Claude) are allowed");
+    assert!(net.contains("guard::check_claude_body"), "the Claude POST must pass the no-tools check");
+    assert!(net.contains(".post(guard::CLAUDE_MESSAGES_URL)"), "the Claude POST goes only to the fixed Messages URL");
     assert!(net.contains("guard::check_rpc_method"), "the JSON-RPC POST must check the method allowlist");
     // Nothing outside net.rs may build its own HTTP client.
     let mut files = Vec::new();

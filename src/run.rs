@@ -265,7 +265,7 @@ pub async fn daemon(cfg: Config) -> Result<()> {
         let today = t / 86_400;
         let sent: i64 = store.meta_get("brief_day")?.and_then(|v| v.parse().ok()).unwrap_or(0);
         if sent < today && (t % 86_400) / 3600 >= cfg.brief_hour_utc as i64 {
-            if let Some(w) = bounded("brief", 180, crate::brief::deliver(&cfg, &store, t, false)).await {
+            if let Some(w) = bounded("brief", 360, crate::brief::deliver(&cfg, &store, t, false)).await {
                 store.meta_set("brief_day", &today.to_string())?;
                 tracing::info!("brief {w}");
             }

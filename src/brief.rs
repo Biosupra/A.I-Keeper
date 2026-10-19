@@ -25,7 +25,7 @@ fn pct(x: f64) -> String {
     format!("{:+.3}%", x * 100.0)
 }
 
-fn day(ts: i64) -> String {
+pub fn day(ts: i64) -> String {
     chrono::DateTime::from_timestamp(ts, 0).map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default()
 }
 
@@ -1475,9 +1475,26 @@ pub async fn send(email: &Email, subject: &str, body: &str) -> Result<()> {
     Ok(())
 }
 
+/// Today's brief with Claude's read on top (claude.rs). Claude never holds the brief back: on any
+/// failure it goes out without the section and says why in one line.
+pub async fn with_claude(cfg: &Config, store: &Store, now: i64, body: String) -> String {
+    match crate::claude::read(cfg.claude.as_ref(), store, &cfg.data_dir, now, &body).await {
+        Ok(Some(section)) => crate::claude::insert(&body, &section),
+        Ok(None) => body,
+        Err(e) => {
+            tracing::warn!("claude: {e:#}");
+            crate::claude::insert(
+                &body,
+                &format!("{}: none today (it hit an error). The numbers below are complete.\n\n", crate::claude::HEADING),
+            )
+        }
+    }
+}
+
 /// Builds today's brief and emails it (or writes it to disk). Returns where it went.
 pub async fn deliver(cfg: &Config, store: &Store, now: i64, force_file: bool) -> Result<String> {
     let (subject, body) = build(store, now, &cfg.primary_vault)?;
+    let body = with_claude(cfg, store, now, body).await;
     let dir = cfg.data_dir.join("briefs");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.txt", day(now)));

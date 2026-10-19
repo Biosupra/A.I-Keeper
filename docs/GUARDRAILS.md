@@ -27,12 +27,18 @@ what the program **can** do, and CI fails the build if any of it erodes.
 
 * Every web request passes `guard::check_host`: Base public RPCs, Coinbase, Deribit, DefiLlama's
   yields API, the Fear & Greed API, five news feeds (CoinDesk, Cointelegraph, Decrypt, The Block,
-  The Defiant), Google Cloud Storage (+ the VM token endpoint) and pandafinancial.org. Each host is
-  named exactly (a look-alike subdomain is refused). Railway, Cloudflare's API, GitHub's API and
-  Alchemy are explicitly denied.
-* The web client exposes **GET only**. The one POST in the program is the JSON-RPC client above,
-  and CI checks that `src/net.rs` has exactly one `.post(` and that it calls the allowlist. No other
+  The Defiant), Google Cloud Storage (+ the VM token endpoint), pandafinancial.org and Anthropic's
+  API. Each host is named exactly (a look-alike subdomain is refused). Railway, Cloudflare's API,
+  GitHub's API and Alchemy are explicitly denied.
+* The web client exposes **GET only**. There are two POSTs in the program: the JSON-RPC client
+  above, and the Claude client, which sends the day's brief to exactly
+  `https://api.anthropic.com/v1/messages` and is refused by `guard::check_claude_body` if the request
+  offers tools, MCP servers or a code container. Claude can only write words into the brief. CI
+  checks that `src/net.rs` has exactly two `.post(` calls and that each passes its check. No other
   file may build its own HTTP client.
+* Claude's spend is capped twice: in code (`AIK_CLAUDE_MONTHLY_USD`, default $10 a month, counted
+  from Claude's own token counts, one call per day recorded before it is made) and by the spend
+  limit on its workspace in the Claude Console.
 * The website is checked with GET only: the Worker's POST routes write to production (a test once
   created a real referral row).
 

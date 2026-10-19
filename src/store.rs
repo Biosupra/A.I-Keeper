@@ -70,6 +70,14 @@ CREATE TABLE IF NOT EXISTS inbox_seen (message_id TEXT PRIMARY KEY, ts INTEGER N
 -- Every alert raised and cleared (see alerts.rs).
 CREATE TABLE IF NOT EXISTS alerts (ts INTEGER NOT NULL, key TEXT NOT NULL, state TEXT NOT NULL, message TEXT NOT NULL);
 
+-- Claude's read of the day (claude.rs): one row per day it was tried, written BEFORE the call so a
+-- brief that is retried never pays twice. `usd` is the real cost from the reply's token counts (an
+-- estimate while no reply has come back); `text` is what Claude wrote, `note` why there is none.
+CREATE TABLE IF NOT EXISTS claude_calls (
+  day INTEGER PRIMARY KEY, ts INTEGER NOT NULL, model TEXT NOT NULL, status INTEGER,
+  input_tokens INTEGER, output_tokens INTEGER, usd REAL NOT NULL, text TEXT, note TEXT
+);
+
 -- Fitted model parameters and small bits of state.
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 

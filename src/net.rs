@@ -2,6 +2,8 @@
 //!
 //! * `Web::get*`: HTTP GET to an allowlisted host. There is deliberately no post/put/delete.
 //! * `Rpc::call*`: JSON-RPC to an allowlisted Base endpoint, allowlisted read-only methods only.
+//! * `Claude::messages`: text to Anthropic's Messages API at one fixed URL, never with tools
+//!   (`guard::check_claude_body`), so what comes back can only be words for the brief.
 
 use crate::guard;
 use anyhow::{anyhow, bail, Context, Result};
@@ -46,6 +48,33 @@ impl Web {
 /// URLs are logged without their query string (tokens never travel in queries here, but be safe).
 pub fn redact(url: &str) -> String {
     url.split('?').next().unwrap_or(url).to_string()
+}
+
+/// Anthropic's Messages API, for the brief's "Claude's read" section (see claude.rs).
+#[derive(Clone)]
+pub struct Claude {
+    client: reqwest::Client,
+}
+
+impl Claude {
+    pub fn new() -> Result<Self> {
+        // A medium-effort answer about one brief takes well under a minute; four is the ceiling.
+        let client =
+            reqwest::Client::builder().timeout(Duration::from_secs(240)).user_agent("PandaFinancial-AIKeeper/0.1 (watch-only)").build()?;
+        Ok(Claude { client })
+    }
+
+    /// One request, no retries. Returns the HTTP status and the JSON body (Null when it is not JSON).
+    pub async fn messages(&self, api_key: &str, beta: Option<&str>, body: &Value) -> Result<(u16, Value)> {
+        guard::check_claude_body(guard::CLAUDE_MESSAGES_URL, body)?;
+        let mut req = self.client.post(guard::CLAUDE_MESSAGES_URL).header("x-api-key", api_key).header("anthropic-version", "2023-06-01");
+        if let Some(b) = beta {
+            req = req.header("anthropic-beta", b);
+        }
+        let resp = req.json(body).send().await.context("POST to the Claude API")?;
+        let status = resp.status().as_u16();
+        Ok((status, resp.json::<Value>().await.unwrap_or(Value::Null)))
+    }
 }
 
 #[derive(Clone)]

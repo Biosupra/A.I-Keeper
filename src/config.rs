@@ -19,6 +19,22 @@ pub struct Email {
     pub to: String,
 }
 
+/// Claude's read of the day (claude.rs). Off unless `AIK_ANTHROPIC_API_KEY` is set.
+#[derive(Clone)]
+pub struct ClaudeCfg {
+    pub api_key: String,
+    pub model: String,
+    /// Dollars Claude may spend per calendar month (UTC), counted from its own replies. The Console
+    /// workspace spend limit is the second fence.
+    pub monthly_usd: f64,
+}
+
+impl std::fmt::Debug for ClaudeCfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClaudeCfg").field("api_key", &"(set)").field("model", &self.model).field("monthly_usd", &self.monthly_usd).finish()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub data_dir: PathBuf,
@@ -50,6 +66,7 @@ pub struct Config {
     /// one, lower-case address, or "old" for the original vault. Default: the WETH/USDC vault of the
     /// multi-vault platform, live since 2026-10-04 (the original vault is withdraw-only since then).
     pub primary_vault: String,
+    pub claude: Option<ClaudeCfg>,
 }
 
 impl Config {
@@ -95,6 +112,11 @@ impl Config {
             disk_budget_gb: num("AIK_DISK_BUDGET_GB", 20.0),
             chain_start_block: num("AIK_CHAIN_START_BLOCK", 51_189_251),
             primary_vault: var("AIK_PRIMARY_VAULT").unwrap_or_else(|| crate::collect::bucket::PRIMARY_DEFAULT.into()).to_lowercase(),
+            claude: var("AIK_ANTHROPIC_API_KEY").map(|api_key| ClaudeCfg {
+                api_key,
+                model: var("AIK_CLAUDE_MODEL").unwrap_or_else(|| "claude-opus-5-5".into()),
+                monthly_usd: num("AIK_CLAUDE_MONTHLY_USD", 10.0),
+            }),
         }
     }
 

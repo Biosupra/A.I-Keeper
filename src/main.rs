@@ -8,6 +8,7 @@
 mod alerts;
 mod brief;
 mod chainmath;
+mod claude;
 mod collect;
 mod config;
 mod guard;
@@ -83,9 +84,12 @@ enum Cmd {
         days: i64,
     },
     /// Build today's brief; `--send` emails it (otherwise it is printed and written to disk).
+    /// `--claude` prints it with Claude's read on top (that is the day's one Claude call).
     Brief {
         #[arg(long)]
         send: bool,
+        #[arg(long)]
+        claude: bool,
     },
     /// Tell the A.I something (kept with the day's decisions and shown in the brief).
     Note { text: Vec<String> },
@@ -177,12 +181,13 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Brief { send } => {
+        Cmd::Brief { send, claude } => {
             let s = store::Store::open(&cfg.db_path())?;
             if send {
                 println!("{}", brief::deliver(&cfg, &s, t, false).await?);
             } else {
                 let (subject, body) = brief::build(&s, t, &cfg.primary_vault)?;
+                let body = if claude { brief::with_claude(&cfg, &s, t, body).await } else { body };
                 println!("{subject}\n\n{body}");
             }
             Ok(())
@@ -339,6 +344,8 @@ async fn selftest(cfg: &config::Config, t: i64) -> Result<()> {
         None => println!("  keeper bucket  disabled"),
     }
     println!("\nemail: {}", if cfg.email.is_some() { "configured" } else { "not configured (briefs go to the data dir)" });
+    let s = store::Store::open(&cfg.db_path()).ok();
+    println!("claude: {}", claude::status_line(cfg.claude.as_ref(), s.as_ref(), t));
     Ok(())
 }
 

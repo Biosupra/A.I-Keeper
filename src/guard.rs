@@ -65,7 +65,32 @@ pub const ALLOWED_HOSTS: &[&str] = &[
     // The owner's mail: sending the brief (SMTP) and reading replies to it (IMAP, read-only EXAMINE).
     "smtp.gmail.com",
     "imap.gmail.com",
+    // Claude (Anthropic's Messages API) writes the brief's "Claude's read" section once a day. Only the
+    // exact URL `CLAUDE_MESSAGES_URL` is used, and `check_claude_body` refuses any request offering tools.
+    "api.anthropic.com",
 ];
+
+/// The one Anthropic URL the A.I may POST to: text in, text out.
+pub const CLAUDE_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
+
+/// Request fields that would let Claude act instead of only writing words (tools, MCP servers, a code
+/// container). A request carrying any of them is refused before it is sent.
+const CLAUDE_FORBIDDEN_FIELDS: &[&str] = &["tools", "tool_choice", "mcp_servers", "container"];
+
+/// Claude may only be asked to write text: the URL must be the Messages endpoint and the request must
+/// offer no tools of any kind.
+pub fn check_claude_body(url: &str, body: &serde_json::Value) -> Result<()> {
+    if url != CLAUDE_MESSAGES_URL {
+        bail!("guard: Claude requests go only to {CLAUDE_MESSAGES_URL}, not {url}");
+    }
+    check_host(url)?;
+    for f in CLAUDE_FORBIDDEN_FIELDS {
+        if body.get(*f).is_some() {
+            bail!("guard: a Claude request may not carry `{f}`; the A.I only asks Claude for words");
+        }
+    }
+    Ok(())
+}
 
 /// Hosts that are refused even if someone adds them above by mistake, with the reason.
 const DENIED_HOSTS: &[(&str, &str)] = &[
