@@ -51,3 +51,70 @@ pub async fn check_all(web: &Web, store: &Store, base: &str, now: i64) -> Result
     }
     Ok(out)
 }
+
+/// The website's own daily digest and weekly agent test, written by Claude on the Worker (worker/ops.ts) and read with
+/// the A.I's token (`AIK_SITE_REPORT_TOKEN`), GET only. `None` when no token is set; a failed read is one line.
+pub async fn ops_section(web: &Web, base: &str, token: Option<&str>, now: i64) -> Option<String> {
+    let token = token?;
+    let url = format!("{}/api/ops/report", base.trim_end_matches('/'));
+    let auth = format!("Bearer {token}");
+    Some(match web.get_json(&url, &[("authorization", auth.as_str())]).await {
+        Ok(v) => ops_words(&v, now),
+        Err(e) => {
+            let why: String = format!("{e:#}").chars().take(160).collect();
+            format!("THE WEBSITE: no report today (could not read it: {why}).\n\n")
+        }
+    })
+}
+
+/// The report in the brief's words: today's digest, and the agent test on the day it ran.
+pub fn ops_words(v: &serde_json::Value, now: i64) -> String {
+    let today = crate::brief::day(now);
+    let (d, a) = (&v["digest"], &v["agent_test"]);
+    let mut b = match (d["day"].as_str(), d["text"].as_str()) {
+        _ if v["configured"] == false => "THE WEBSITE: off (the site's Claude key is not set).\n".to_string(),
+        (Some(day), Some(text)) if day == today => {
+            format!("THE WEBSITE (Claude's look at the site's own records for the last 24 hours)\n{}\n", text.trim())
+        }
+        (Some(day), None) if day == today => {
+            format!("THE WEBSITE: no digest today ({}).\n", d["note"].as_str().unwrap_or("no answer recorded"))
+        }
+        (Some(day), _) => format!("THE WEBSITE: no digest for today yet (the newest is from {day}).\n"),
+        _ => "THE WEBSITE: no digest yet.\n".to_string(),
+    };
+    if a["day"].as_str() == Some(today.as_str()) {
+        b += &match a["text"].as_str() {
+            Some(t) => format!("\nAGENT TEST (weekly: a Claude agent used the agent API the way a customer would)\n{}\n", t.trim()),
+            None => format!("\nAGENT TEST: no report this week ({}).\n", a["note"].as_str().unwrap_or("no answer recorded")),
+        };
+    }
+    if let (Some(m), Some(c)) = (v["month_usd"].as_f64(), v["cap_usd"].as_f64()) {
+        b += &format!("(Website Claude: ${m:.2} of this month's ${c:.2} limit.)\n");
+    }
+    b + "\n"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn ops_report_in_plain_words() {
+        let now = 1_792_400_000; // 2026-10-19
+        let v = json!({"configured": true, "month_usd": 1.234, "cap_usd": 8.0,
+            "digest": {"day": "2026-10-19", "text": "PROBLEMS USERS HIT\n• none", "note": null},
+            "agent_test": {"day": "2026-10-19", "text": "RESULT: PASS", "note": null}});
+        let s = ops_words(&v, now);
+        assert!(s.starts_with("THE WEBSITE (") && s.contains("• none") && s.contains("AGENT TEST") && s.contains("RESULT: PASS"), "{s}");
+        assert!(s.contains("$1.23 of this month's $8.00 limit"));
+        // Yesterday's digest and last week's test: said once, not repeated.
+        let old = json!({"configured": true, "digest": {"day": "2026-10-18", "text": "x"}, "agent_test": {"day": "2026-10-13", "text": "RESULT: PASS"}});
+        let s = ops_words(&old, now);
+        assert!(s.contains("no digest for today yet (the newest is from 2026-10-18)") && !s.contains("AGENT TEST"), "{s}");
+        let off = json!({"configured": false, "digest": null, "agent_test": null});
+        assert!(ops_words(&off, now).contains("off (the site's Claude key is not set)"));
+        let failed = json!({"configured": true, "digest": {"day": "2026-10-19", "text": null, "note": "the API credits are used up until they refill"}});
+        assert!(ops_words(&failed, now).contains("no digest today (the API credits are used up"));
+    }
+}

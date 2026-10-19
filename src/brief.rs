@@ -1475,10 +1475,11 @@ pub async fn send(email: &Email, subject: &str, body: &str) -> Result<()> {
     Ok(())
 }
 
-/// Today's brief with Claude's read on top (claude.rs). Claude never holds the brief back: on any
-/// failure it goes out without the section and says why in one line.
+/// Today's brief with Claude's read on top (claude.rs), then the website's own report (its daily digest and
+/// weekly agent test, collect/site.rs). Neither ever holds the brief back: on any failure it goes out
+/// without that section and says why in one line.
 pub async fn with_claude(cfg: &Config, store: &Store, now: i64, body: String) -> String {
-    match crate::claude::read(cfg.claude.as_ref(), store, &cfg.data_dir, now, &body).await {
+    let body = match crate::claude::read(cfg.claude.as_ref(), store, &cfg.data_dir, now, &body).await {
         Ok(Some(section)) => crate::claude::insert(&body, &section),
         Ok(None) => body,
         Err(e) => {
@@ -1488,6 +1489,14 @@ pub async fn with_claude(cfg: &Config, store: &Store, now: i64, body: String) ->
                 &format!("{}: none today (it hit an error). The numbers below are complete.\n\n", crate::claude::HEADING),
             )
         }
+    };
+    let website = match crate::net::Web::new() {
+        Ok(web) => crate::collect::site::ops_section(&web, &cfg.site, cfg.site_report_token.as_deref(), now).await,
+        Err(e) => Some(format!("THE WEBSITE: no report today ({e:#}).\n\n")),
+    };
+    match website {
+        Some(section) => crate::claude::insert(&body, &section),
+        None => body,
     }
 }
 

@@ -84,6 +84,8 @@ if [ -f "$ENV" ]; then
   set_var AIK_SMTP_PASSWORD "$(md aik-smtp-password)"
   # Claude's read of the day: the API key from its own Console workspace (metadata key aik-anthropic-key).
   set_var AIK_ANTHROPIC_API_KEY "$(md aik-anthropic-key)"
+  # The website's own report (its daily digest and weekly agent test): the same token as the Worker's OPS_REPORT_TOKEN.
+  set_var AIK_SITE_REPORT_TOKEN "$(md aik-site-report-token)"
   chmod 0640 "$ENV" && chgrp aikeeper "$ENV"
 fi
 systemctl restart aikeeper

@@ -67,6 +67,9 @@ pub struct Config {
     /// multi-vault platform, live since 2026-10-04 (the original vault is withdraw-only since then).
     pub primary_vault: String,
     pub claude: Option<ClaudeCfg>,
+    /// Token for the website's own report (GET /api/ops/report: Claude's daily site digest and weekly agent test),
+    /// shown in the brief. Unset = the brief has no website section.
+    pub site_report_token: Option<String>,
 }
 
 impl Config {
@@ -117,6 +120,7 @@ impl Config {
                 model: var("AIK_CLAUDE_MODEL").unwrap_or_else(|| "claude-opus-5-5".into()),
                 monthly_usd: num("AIK_CLAUDE_MONTHLY_USD", 10.0),
             }),
+            site_report_token: var("AIK_SITE_REPORT_TOKEN"),
         }
     }
 
