@@ -1,0 +1,25 @@
+[Unit]
+Description=Panda Financial A.I Keeper (watch-only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=aikeeper
+Group=aikeeper
+EnvironmentFile=/etc/aikeeper.env
+ExecStart=/usr/local/bin/aikeeper run
+Restart=always
+RestartSec=30
+# Keep it small on a 1 GB machine and away from the rest of the system.
+MemoryMax=600M
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/aikeeper
+CapabilityBoundingSet=
+# AF_NETLINK: glibc's resolver may query interfaces over netlink.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
