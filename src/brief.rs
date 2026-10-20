@@ -283,12 +283,126 @@ fn pool_obs(store: &Store, at: i64) -> Option<(f64, f64, Option<f64>, Option<f64
     store
         .db
         .query_row(
-            "SELECT CAST(liquidity AS REAL), CAST(staked_liquidity AS REAL), reward_rate, aero_usd FROM pool_obs
+            // What is really paid (Aerodrome's phantom rate after its end is 0, Aero's is the voter's rate); rows read
+            // before the effective rate was stored fall back to the raw one, and to 0 from the Aero launch.
+            "SELECT CAST(liquidity AS REAL), CAST(staked_liquidity AS REAL),
+                    COALESCE(reward_rate_effective, CASE WHEN ts >= ?2 THEN 0.0 ELSE reward_rate END), aero_usd FROM pool_obs
              WHERE ts <= ?1 AND staked_liquidity IS NOT NULL ORDER BY ts DESC LIMIT 1",
-            [at],
+            [at, crate::aero::LAUNCH_TS],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .ok()
+}
+
+/// Aerodrome's phantom rate: Some((AERO/s its gauge still reports, the day its rewards ended)) when the day's
+/// latest Aerodrome reading shows a rate that is no longer paid (`aero::aerodrome_paying`).
+fn aerodrome_phantom(store: &Store, since: i64) -> Option<(f64, i64)> {
+    let (ts, raw, finish): (i64, Option<f64>, Option<i64>) = store
+        .db
+        .query_row(
+            "SELECT ts, reward_rate, period_finish FROM pool_obs WHERE gauge_mode = 'aerodrome' AND ts > ?1 ORDER BY ts DESC LIMIT 1",
+            [since],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .ok()?;
+    let raw = raw.filter(|r| *r > 0.0)?;
+    if crate::aero::aerodrome_paying(finish, ts) {
+        return None;
+    }
+    Some((raw, crate::aero::aerodrome_rewards_end(finish.map(|f| (ts, f)))))
+}
+
+/// Aero's rate over the day, per unit of in-range staked liquidity (whole AERO per second): the chain's (the
+/// LeafVoter's rate net of the referral cut, averaged over the day's 30-second reads) and the one measured from
+/// the followed vault's own positions' `earned` (the keeper's snapshots), when it can be measured.
+struct AeroDay {
+    on_chain: f64,
+    measured: Option<crate::aero::MeasuredRate>,
+}
+
+fn aero_day(store: &Store, vault: &str, since: i64, now: i64) -> Result<Option<AeroDay>> {
+    let on_chain: Option<f64> = store.db.query_row(
+        "SELECT AVG(reward_rate_effective / CAST(staked_liquidity AS REAL)) FROM pool_obs
+         WHERE gauge_mode = 'aero' AND ts > ?1 AND ts <= ?2 AND reward_rate_effective IS NOT NULL AND CAST(staked_liquidity AS REAL) > 0",
+        [since, now],
+        |r| r.get(0),
+    )?;
+    let Some(on_chain) = on_chain else { return Ok(None) };
+    Ok(Some(AeroDay { on_chain, measured: measured_aero_rate(store, vault, since, now)? }))
+}
+
+/// The measured earned-delta rate (`aero::EarnedRateMeter`) over the keeper's position snapshots in the window.
+/// A position that may be inside the early-unstake window (in BLOCKS: its `depositBlock` from the gauge, or the
+/// keeper's, plus `minStakeBlocks`, against the block of the last pool read at or before the snapshot) is left
+/// out, so the jump when the window ends is not read as earnings.
+fn measured_aero_rate(store: &Store, vault: &str, since: i64, now: i64) -> Result<Option<crate::aero::MeasuredRate>> {
+    let at = |k: &str| store.series_at("gauge", k, now).ok().flatten().map(|x| x.1.max(0.0) as u64);
+    let window = crate::aero::PenaltyWindow {
+        min_stake_blocks: at("aero_min_stake_blocks").unwrap_or(0),
+        penalty_rate_pips: at("aero_penalty_rate_pips").unwrap_or(0),
+    };
+    let deposit: std::collections::HashMap<i64, i64> = {
+        let mut st = store.db.prepare("SELECT token_id, deposit_block FROM aero_stakes")?;
+        let r = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        r.filter_map(|x| x.ok()).collect()
+    };
+    type Snap = (i64, i64, f64, Option<f64>, Option<i64>, Option<i64>);
+    let rows: Vec<Snap> = {
+        let mut st = store.db.prepare(
+            "SELECT ts, token_id, earned_aero_gross, CAST(liquidity AS REAL), in_range, deposit_block FROM position_min
+             WHERE vault = ?1 AND ts > ?2 AND ts <= ?3 AND earned_aero_gross IS NOT NULL ORDER BY ts",
+        )?;
+        let r =
+            st.query_map(rusqlite::params![vault, since, now], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?;
+        r.filter_map(|x| x.ok()).collect()
+    };
+    let mut meter = crate::aero::EarnedRateMeter::default();
+    let (mut delta, mut l_secs, mut n) = (0.0, 0.0, 0usize);
+    let mut i = 0;
+    while i < rows.len() {
+        let ts = rows[i].0;
+        let head_lo: Option<u64> = if window.active() {
+            store
+                .db
+                .query_row("SELECT block FROM pool_obs WHERE ts <= ?1 AND block > 0 ORDER BY ts DESC LIMIT 1", [ts], |r| r.get::<_, i64>(0))
+                .ok()
+                .map(|b| b as u64)
+        } else {
+            None
+        };
+        let mut samples = Vec::new();
+        while i < rows.len() && rows[i].0 == ts {
+            let (_, id, earned, liq, inr, keeper_deposit) = rows[i];
+            let deposit_block = deposit.get(&id).copied().or(keeper_deposit).map(|b| b.max(0) as u64);
+            samples.push(crate::aero::EarnedSample {
+                token_id: id as u64,
+                earned_wei: earned * 1e18,
+                liquidity: liq.unwrap_or(0.0).max(0.0) as u128,
+                in_range: inr == Some(1),
+                penalised: window.maybe_inside(deposit_block, head_lo),
+            });
+            i += 1;
+        }
+        let (d, l, c) = meter.observe_sums(ts, &samples);
+        delta += d;
+        l_secs += l;
+        n += c;
+    }
+    Ok((n > 0 && l_secs > 0.0).then(|| crate::aero::MeasuredRate {
+        wei_per_s_per_l: delta / l_secs / 1e18,
+        positions: n,
+        liquidity_seconds: l_secs,
+    }))
+}
+
+/// "aero (probed …)" for the report: which gauge mode the A.I runs in.
+fn gauge_mode_words(store: &Store) -> String {
+    match crate::collect::gauge::recorded_mode(store) {
+        Some(m) => {
+            format!("{} (AERO price: {})", m.name(), store.meta_get("aero_price_source").ok().flatten().unwrap_or_else(|| "unknown".into()))
+        }
+        None => "not probed yet (the gauge is not read)".into(),
+    }
 }
 
 /// The average half-width (%) of the ranges other LPs opened in the window.
@@ -305,7 +419,7 @@ fn other_lp_width(store: &Store, since: i64) -> Result<Option<f64>> {
 }
 
 /// The pool section of the technical detail: everything the A.I saw happen in the Panda pool and its gauge.
-fn pool_section(b: &mut String, store: &Store, since: i64, now: i64, vaults: &[VaultDay]) -> Result<()> {
+fn pool_section(b: &mut String, store: &Store, since: i64, now: i64, primary: &str, vaults: &[VaultDay]) -> Result<()> {
     writeln!(b, "\nPOOL (last 24 h, read straight from Base)")?;
     let (n, vol, big, bought, sold, lo, hi) = swap_totals(store, since)?;
     if n == 0 {
@@ -358,6 +472,77 @@ fn pool_section(b: &mut String, store: &Store, since: i64, now: i64, vaults: &[V
             g("early_withdraw_penalty").0
         )?;
     }
+    writeln!(b, "  Gauge mode: {}", gauge_mode_words(store))?;
+    if let Some((raw, end)) = aerodrome_phantom(store, since) {
+        writeln!(
+            b,
+            "  Aerodrome gauge: rewardRate() still reads {raw:.4} AERO/s, but its rewards ended on {}: counted as 0 (raw value kept)",
+            day(end)
+        )?;
+    }
+    if crate::collect::gauge::recorded_mode(store) == Some(crate::aero::GaugeMode::Aero) {
+        let g = |k: &str| store.series_at("gauge", k, now).ok().flatten().filter(|(t, _)| now - t < 3 * 3600).map(|x| x.1);
+        let latest: Option<(Option<f64>, Option<f64>, Option<i64>)> = store
+            .db
+            .query_row(
+                "SELECT aero_gross_rate, reward_rate_effective, aero_activated FROM pool_obs WHERE gauge_mode = 'aero' ORDER BY ts DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .ok();
+        if let Some((gross, net, active)) = latest {
+            writeln!(
+                b,
+                "  Aero LeafVoter rate: {} AERO/s gross, {} AERO/s to stakers after the referral cut · gauge {} · cap {} AERO/s · early-exit window {} blocks (0 = none)",
+                gross.map(|x| format!("{x:.6}")).unwrap_or_else(|| "-".into()),
+                net.map(|x| format!("{x:.6}")).unwrap_or_else(|| "-".into()),
+                match active {
+                    Some(1) => "activated",
+                    Some(_) => "NOT activated (pays nothing)",
+                    None => "state unknown",
+                },
+                g("aero_emission_cap_aero_s").map(|x| format!("{x:.4}")).unwrap_or_else(|| "-".into()),
+                g("aero_min_stake_blocks").map(|x| format!("{x:.0}")).unwrap_or_else(|| "-".into())
+            )?;
+        }
+        // The exact on-chain amount over the day: the rise of projectedCumulativeRewardShare.
+        let ends: Vec<(i64, f64)> = {
+            let mut st = store.db.prepare(
+                "SELECT ts, CAST(aero_projected_share AS REAL) FROM pool_obs WHERE gauge_mode = 'aero' AND aero_projected_share IS NOT NULL AND ts > ?1
+                 AND (ts = (SELECT MIN(ts) FROM pool_obs WHERE gauge_mode = 'aero' AND aero_projected_share IS NOT NULL AND ts > ?1)
+                   OR ts = (SELECT MAX(ts) FROM pool_obs WHERE gauge_mode = 'aero' AND aero_projected_share IS NOT NULL AND ts > ?1)) ORDER BY ts",
+            )?;
+            let r = st.query_map([since], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            r.filter_map(|x| x.ok()).collect()
+        };
+        if let (Some(first), Some(last)) = (ends.first(), ends.last()) {
+            if let Some(rate) = crate::aero::projected_share_rate(*first, *last) {
+                writeln!(
+                    b,
+                    "  Aero gauge credited {:.1} AERO a day gross over the window (projected cumulative reward share)",
+                    rate / 1e18 * 86_400.0
+                )?;
+            }
+        }
+        if let Some(a) = aero_day(store, primary, since, now)? {
+            writeln!(
+                b,
+                "  Aero rate per unit of in-range staked liquidity: on-chain {:.4e} AERO/s{}",
+                a.on_chain,
+                match a.measured {
+                    Some(m) => format!(
+                        ", measured {:.4e} from {} position readings (ratio {})",
+                        m.wei_per_s_per_l,
+                        m.positions,
+                        crate::aero::cross_check_ratio(m.wei_per_s_per_l, a.on_chain)
+                            .map(|r| format!("{r:.3}"))
+                            .unwrap_or_else(|| "-".into())
+                    ),
+                    None => ", not measured yet (no two keeper snapshots of a position in range)".into(),
+                }
+            )?;
+        }
+    }
     if let Some((active, staked, rate, aero)) = pool_obs(store, now) {
         let before =
             pool_obs(store, since).map(|(a, s, _, _)| if a > 0.0 { format!(" (a day ago {:.0}%)", s / a * 100.0) } else { String::new() });
@@ -381,7 +566,8 @@ fn pool_section(b: &mut String, store: &Store, since: i64, now: i64, vaults: &[V
             let per_day = r * 86_400.0;
             let usd = aero.map(|a| format!(" (≈ {})", usd_short(per_day * a))).unwrap_or_default();
             let finish = store.series_at("gauge", "period_finish", now)?.map(|(_, v)| v as i64).filter(|f| *f > now);
-            let share = store.series_at("gauge", "voter_share", now)?.map(|(_, v)| v);
+            // The Aerodrome vote share is only read on Aerodrome's gauge: an old reading is not shown as today's.
+            let share = store.series_at("gauge", "voter_share", now)?.filter(|(t, _)| now - t < 3 * 3600).map(|(_, v)| v);
             writeln!(
                 b,
                 "  Emissions: {:.0} AERO a day to stakers{usd}{}{}",
@@ -512,15 +698,18 @@ pub fn build(store: &Store, now: i64, primary: &str) -> Result<(String, String)>
             writeln!(b, "{}", format!("    - The website had trouble: {u} answered {s} {n}").trim_end())?;
         }
     }
+    // A vault on Aerodrome's gauge earns nothing once Aerodrome's rewards have ended: in range, but not earning.
+    let unpaid = |vault: &str| crate::collect::gauge::rewards_end_for(store, vault).map(|e| now >= e).unwrap_or(false);
     for d in &vaults {
         let name = vault_name(&d.vault);
         let mut line = match d.snapshot_ts {
             Some(_) => format!(
-                "• {}: {} worth {} in total, {} earning rewards right now",
+                "• {}: {} worth {} in total, {} {}",
                 title(&d.vault, primary),
                 plural(d.positions, "position", "positions"),
                 money(d.positions_usd),
-                d.in_range
+                d.in_range,
+                if unpaid(&d.vault) { "in range right now (Aerodrome pays no rewards any more)" } else { "earning rewards right now" }
             ),
             None => format!("• {}: no recent snapshot from its keeper", capitalise(&name)),
         };
@@ -542,6 +731,37 @@ pub fn build(store: &Store, now: i64, primary: &str) -> Result<(String, String)>
     if let Some(s) = &shadow7 {
         writeln!(b, "• The A.I {}.", ai_verdict(s))?;
     }
+    // Aero (2026-10-22): Aerodrome's gauge keeps reporting a rate it no longer pays; Aero's rate, checked.
+    if let Some((raw, end)) = aerodrome_phantom(store, since) {
+        writeln!(b, "• Aerodrome rewards ended on {}; the gauge still reports {raw:.2} AERO/s but pays nothing.", day(end))?;
+    }
+    if crate::collect::gauge::recorded_mode(store) == Some(crate::aero::GaugeMode::Aero) {
+        if let Some(a) = aero_day(store, primary, since, now)? {
+            let liq: f64 = vaults.iter().filter(|d| d.vault == primary).map(|d| d.in_range_liquidity).sum();
+            let per_day = |r: f64| commas(r * liq * 86_400.0);
+            let measured = match a.measured {
+                Some(m) => match crate::aero::cross_check_ratio(m.wei_per_s_per_l, a.on_chain) {
+                    Some(ratio) if liq > 0.0 => format!(
+                        "what they actually earned works out to {} AERO a day ({:.0}% of the chain's rate)",
+                        per_day(m.wei_per_s_per_l),
+                        ratio * 100.0
+                    ),
+                    Some(ratio) => format!("what Panda's positions actually earned is {:.0}% of the chain's rate", ratio * 100.0),
+                    None => "Panda's positions measured no earnings".into(),
+                },
+                None => "what they actually earned cannot be measured yet".into(),
+            };
+            if liq > 0.0 {
+                writeln!(
+                    b,
+                    "• Aero rewards (the A.I reads Aero's gauge): at the chain's rate Panda's earning positions get about {} AERO a day; {measured}.",
+                    per_day(a.on_chain)
+                )?;
+            } else {
+                writeln!(b, "• Aero rewards (the A.I reads Aero's gauge): measured vs on-chain rate: {measured}.")?;
+            }
+        }
+    }
 
     // ---------- 2. the vaults ----------
     writeln!(b, "\nYOUR VAULTS")?;
@@ -562,12 +782,15 @@ pub fn build(store: &Store, now: i64, primary: &str) -> Result<(String, String)>
                     money(d.positions_usd),
                     if d.positions == 0 {
                         "It is empty.".to_string()
+                    } else if out == 0 && unpaid(&d.vault) {
+                        "All of them are inside their price range, but Aerodrome pays no rewards any more.".to_string()
                     } else if out == 0 {
                         "All of them are inside their price range, so they are all earning.".to_string()
                     } else {
                         format!(
-                            "{} earning; {} outside {} range for now (paused until the price comes back or the keeper moves {}).",
+                            "{} {}; {} outside {} range for now (paused until the price comes back or the keeper moves {}).",
                             d.in_range,
+                            if unpaid(&d.vault) { "in range (Aerodrome pays no rewards any more)" } else { "earning" },
                             out,
                             if out == 1 { "its" } else { "their" },
                             if out == 1 { "it" } else { "them" }
@@ -630,7 +853,8 @@ pub fn build(store: &Store, now: i64, primary: &str) -> Result<(String, String)>
     }
     if let Some((_, staked, Some(rate), aero)) = pool_obs(store, now) {
         let per_day = rate * 86_400.0;
-        let mut l = format!("  Aerodrome pays this pool's stakers {} AERO a day", commas(per_day));
+        let payer = if crate::collect::gauge::recorded_mode(store) == Some(crate::aero::GaugeMode::Aero) { "Aero" } else { "Aerodrome" };
+        let mut l = format!("  {payer} pays this pool's stakers {} AERO a day", commas(per_day));
         if let Some(a) = aero {
             l += &format!(" (about {})", money(per_day * a));
         }
@@ -965,7 +1189,7 @@ fn technical(
     ) {
         writeln!(b, "  Coinbase ETH-USD book: spread {sp:.2} bp · within 1%: {} bids, {} asks", usd_short(bid), usd_short(ask))?;
     }
-    pool_section(b, store, since, now, vaults)?;
+    pool_section(b, store, since, now, primary, vaults)?;
 
     writeln!(b, "\nKEEPER ACTIVITY (from each keeper's history in the bucket)")?;
     for d in vaults {
@@ -1208,6 +1432,20 @@ fn rules_compare_plain(b: &mut String, store: &Store, now: i64, primary: &str) -
             mean(&|r| r.3),
             by_day.len()
         )?;
+    }
+    let ended = store.count(
+        "SELECT COUNT(*) FROM rules_compare WHERE vault = ?1 AND made_ts > ?2 AND gauge_mode = 'aerodrome-ended'",
+        &[&primary, &(now - 30 * 86_400)],
+    )?;
+    let on_aero = store.count(
+        "SELECT COUNT(*) FROM rules_compare WHERE vault = ?1 AND made_ts > ?2 AND gauge_mode = 'aero'",
+        &[&primary, &(now - 30 * 86_400)],
+    )?;
+    if ended > 0 {
+        writeln!(b, "  {ended} of these hours ran past the end of Aerodrome's rewards (2026-10-22): from then their rewards count as zero, for both sets of rules.")?;
+    }
+    if on_aero > 0 {
+        writeln!(b, "  {on_aero} of these hours were replayed on Aero's gauge, with the keeper's Aero rate.")?;
     }
     if !any {
         writeln!(b, "  Nothing scored yet: the first hours are graded a day after they are made.")?;
@@ -1545,6 +1783,79 @@ mod tests {
         assert!(body.contains("The original vault") && body.contains("1 new deposit ($23.07)"), "{body}");
         assert!(body.contains("deposits 1 ($23.07)"), "technical detail keeps the raw counts: {body}");
         assert!(body.contains("too narrow today"));
+    }
+
+    #[test]
+    fn the_short_version_says_when_aerodrome_pays_nothing_and_checks_aeros_rate() {
+        let launch = crate::aero::LAUNCH_TS;
+        let obs = |s: &Store, ts: i64, mode: &str, raw: Option<f64>, finish: Option<i64>, eff: f64| {
+            s.db.execute(
+                "INSERT INTO pool_obs (ts, block, tick, sqrt_price, liquidity, staked_liquidity, reward_rate, period_finish, reward_rate_effective, gauge_mode, aero_usd)
+                 VALUES (?1, 52900000, -197254, '0', '50000000000000000', '20000000000000000', ?2, ?3, ?4, ?5, 0.8)",
+                rusqlite::params![ts, raw, finish, eff, mode],
+            )
+            .unwrap();
+        };
+        // Aerodrome after the launch: rewardRate() still 0.503, nothing paid.
+        let s = Store::memory().unwrap();
+        obs(&s, launch + 3600, "aerodrome", Some(0.503), Some(launch), 0.0);
+        s.meta_set("gauge_mode", "aerodrome").unwrap();
+        let (_, body) = build(&s, launch + 7200, PRIMARY_DEFAULT).unwrap();
+        let short = body.split("YOUR VAULTS").next().unwrap();
+        assert!(
+            short.contains("• Aerodrome rewards ended on 2026-10-22; the gauge still reports 0.50 AERO/s but pays nothing."),
+            "{short}"
+        );
+        assert!(body.contains("Gauge mode: aerodrome"), "the report says which mode it ran in");
+        assert!(!body.contains("Aerodrome pays this pool's stakers 43,459"), "the phantom 0.503 AERO/s is not reported as paid: {body}");
+        // An Aerodrome vault's positions in range are not "earning" after the end.
+        s.db.execute(
+            "INSERT INTO position_min (token_id, ts, vault, position_usd, in_range, liquidity) VALUES (1, ?1, ?2, 50.0, 1, '1000')",
+            rusqlite::params![launch + 7000, PRIMARY_DEFAULT],
+        )
+        .unwrap();
+        let (_, body) = build(&s, launch + 7200, PRIMARY_DEFAULT).unwrap();
+        assert!(body.contains("1 in range right now (Aerodrome pays no rewards any more)"), "{body}");
+        assert!(body.contains("All of them are inside their price range, but Aerodrome pays no rewards any more."), "{body}");
+        assert!(!body.contains("earning rewards right now"), "{body}");
+        // Before the launch, inside the period: paid, no such line.
+        let s = Store::memory().unwrap();
+        obs(&s, launch - 7200, "aerodrome", Some(0.503), Some(launch), 0.503);
+        let (_, body) = build(&s, launch - 3600, PRIMARY_DEFAULT).unwrap();
+        assert!(!body.contains("Aerodrome rewards ended"), "{body}");
+        assert!(body.contains("Aerodrome pays this pool's stakers 43,459 AERO a day"), "{body}");
+
+        // Aero: the chain's rate (0.001 AERO/s over 2e16 staked) and the vault's own positions' earnings agree.
+        let s = Store::memory().unwrap();
+        s.meta_set("gauge_mode", "aero").unwrap();
+        s.meta_set("gauge_mode_vault", PRIMARY_DEFAULT).unwrap();
+        s.meta_set("aero_price_source", "aerodrome-fallback").unwrap();
+        let now = launch + 2 * 86_400;
+        for k in 0..48 {
+            obs(&s, now - 86_000 + k * 1800, "aero", None, None, 0.001);
+        }
+        // Two in-range positions of 1e15 each: 0.001 x 1e15 / 2e16 = 5e-5 AERO/s each, sampled every minute.
+        for m in 0..120 {
+            let ts = now - 7200 + m * 60;
+            for id in [7i64, 9] {
+                s.db.execute(
+                    "INSERT INTO position_min (token_id, ts, vault, position_usd, in_range, liquidity, earned_aero_gross) VALUES (?1, ?2, ?3, 100.0, 1, '1000000000000000', ?4)",
+                    rusqlite::params![id, ts, PRIMARY_DEFAULT, 0.3 + 5e-5 * (m * 60) as f64],
+                )
+                .unwrap();
+            }
+        }
+        let (_, body) = build(&s, now, PRIMARY_DEFAULT).unwrap();
+        let short = body.split("YOUR VAULTS").next().unwrap();
+        assert!(
+            short.contains("• Aero rewards (the A.I reads Aero's gauge): at the chain's rate Panda's earning positions get about 9 AERO a day; what they actually earned works out to 9 AERO a day (100% of the chain's rate)."),
+            "{short}"
+        );
+        assert!(!short.contains("Aerodrome rewards ended"), "no Aerodrome reading in Aero mode");
+        assert!(body.contains("Gauge mode: aero (AERO price: aerodrome-fallback)"), "{body}");
+        assert!(body.contains("Aero pays this pool's stakers"), "{body}");
+        assert!(body.contains("measured 5.0000e-20 from"), "{body}");
+        assert!(body.contains("2 earning rewards right now"), "the Aero vault's positions do earn: {body}");
     }
 
     #[test]

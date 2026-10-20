@@ -1,0 +1,5 @@
+Base RPC from this cloud container (network policy):
+== mainnet.base.org: curl: (56) CONNECT tunnel failed, response 403
+== base-rpc.publicnode.com: curl: (56) CONNECT tunnel failed, response 403
+== base.drpc.org: curl: (56) CONNECT tunnel failed, response 403
+== base.gateway.tenderly.co: curl: (56) CONNECT tunnel failed, response 403

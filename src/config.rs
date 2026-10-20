@@ -42,6 +42,12 @@ pub struct Config {
     pub rpc_urls: Vec<String>,
     pub pool: String,
     pub gauge: String,
+    /// `AIK_GAUGE_MODE`: auto (default: the gauge is probed once), aerodrome or aero. A value that is none of
+    /// these is kept as the error it is and reported; the gauge is then not read.
+    pub gauge_mode: Result<crate::aero::GaugeModeSetting, String>,
+    /// `AIK_AERO_WETH_POOL`: the AERO/WETH pool that prices AERO. Unset = Aerodrome's AERO/WETH CL200 pool
+    /// (`chain::AERO_WETH_POOL`), which in Aero mode prices the new AERO one for one with the old.
+    pub aero_weth_pool: Option<String>,
     /// The keeper's history bucket (read-only).
     pub bucket: Option<String>,
     /// First day of keeper history to ingest (YYYY-MM-DD).
@@ -96,6 +102,8 @@ impl Config {
             // The live Panda deployment (verified addresses; see the dapp's src/config/contracts.ts).
             pool: var("AIK_POOL").unwrap_or_else(|| "0x3FE04A59Ebd38cF06080a6F60a98D124eb59392A".into()),
             gauge: var("AIK_GAUGE").unwrap_or_else(|| "0xA0B61fdB9f1FB9b917Fe38b49427Fd4D87472D28".into()),
+            gauge_mode: var("AIK_GAUGE_MODE").unwrap_or_default().parse(),
+            aero_weth_pool: var("AIK_AERO_WETH_POOL"),
             bucket: match var("AIK_BUCKET").as_deref() {
                 Some("none") => None,
                 Some(b) => Some(b.to_string()),

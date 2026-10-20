@@ -1,0 +1,98 @@
+
+running 83 tests
+test alerts::tests::new_alert_is_sent_once_then_resent_after_six_hours_then_resolved ... ok
+test alerts::tests::independent_alerts ... ok
+test chainmath::tests::negative_tick_word ... ok
+test brief::tests::plain_words ... ok
+test chainmath::tests::price_from_tick_matches_live_pool ... ok
+test chainmath::tests::selectors ... ok
+test chainmath::tests::signed_words ... ok
+test claude::tests::replies_become_text_and_dollars_or_a_reason ... ok
+test claude::tests::request_offers_no_tools_and_passes_the_guard ... ok
+test claude::tests::the_section_goes_above_the_short_version ... ok
+test claude::tests::one_call_a_day_and_the_monthly_cap ... ok
+test collect::bucket::tests::day_list ... ok
+test collect::bucket::tests::lean_selection ... ok
+test collect::bucket::tests::archives_and_decodes_every_table ... ok
+test brief::tests::brief_builds_on_empty_and_real_rows ... ok
+test collect::chain::tests::aero_price_from_the_two_pools ... ok
+test collect::flow::tests::backfills_old_ranges_contiguously ... ignored
+test brief::tests::crash_wait_counts_the_regime_holds_and_warns_when_none_fired ... ok
+test collect::flow::tests::decodes_archives_and_never_double_counts ... ok
+test collect::liquidity::tests::profile_walks_nets_from_the_current_tick ... ok
+test collect::market::tests::book_depth ... ok
+test collect::liquidity::tests::tick_argument_encoding ... ok
+test collect::market::tests::source_names ... ok
+test collect::news::tests::tag_names_are_exact ... ok
+test collect::news::tests::parses_the_shapes_the_feeds_use ... ok
+test collect::site::tests::ops_report_in_plain_words ... ok
+test collect::bucket::tests::new_vault_rows_are_tagged_with_their_vault ... ok
+test guard::tests::every_collector_url_passes_the_guard ... ok
+test guard::tests::environment ... ok
+test guard::tests::reads_are_allowed ... ok
+test guard::tests::sending_and_signing_are_refused ... ok
+test guard::tests::hosts ... ok
+test inbox::tests::owner_reply_is_kept_without_the_quote ... ok
+test inbox::tests::quote_markers ... ok
+test model::exit::tests::formula_limits ... ok
+test inbox::tests::strangers_and_spoofs_are_ignored ... ok
+test model::har::tests::fit_needs_history ... ok
+test model::har::tests::ols_recovers_known_weights ... ok
+test collect::bucket::tests::parses_real_keeper_rows ... ok
+test model::regime::tests::a_fall_waits_for_the_bottom_then_reopens ... ok
+test model::regime::tests::regime_settings_come_from_the_keeper_only_in_regime_mode ... ok
+test model::regime::tests::the_table_replay_reports_dollars_too ... ok
+test model::regime::tests::a_fall_is_held_for_the_price_to_come_back_and_a_rise_is_not ... ok
+test model::regime::tests::verified_calm_opens_narrow_and_a_flat_day_keeps_the_dollar ... ok
+test inbox::tests::stored_once ... ok
+test model::shadow::tests::divergence_matches_closed_form ... ok
+test model::shadow::tests::confirmation_then_one_rebalance ... ok
+test model::shadow::tests::crash_valve_sits_out_inside_its_caps_only ... ok
+test model::shadow::tests::hysteresis_rules ... ok
+test model::shadow::tests::keeper_run_policy_parses ... ok
+test model::shadow::tests::max_three_rebalances_a_day ... ok
+test model::shadow::tests::fee_hold_then_max_hold ... ok
+test model::shadow::tests::real_table_cost_matches_keeper_formula ... ok
+test model::shadow::tests::rescore_is_continuous_near_keeper_vol ... ok
+test model::shadow::tests::same_vol_reproduces_keeper_scores_and_choice ... ok
+test model::shadow::tests::size_adjustment_is_exact_at_table_size ... ok
+test model::shadow::tests::flat_price_earns_revenue_only ... ok
+test model::shadow::tests::wick_that_re_enters_restarts_the_clock ... ok
+test model::shadow::tests::narrowing_needs_an_anchor_and_the_floor ... ok
+test model::vol::tests::qlike_zero_when_right ... ok
+test model::vol::tests::realised_needs_coverage ... ok
+test model::vol::tests::realised_recovers_true_vol ... ok
+test model::shadow::tests::widening_recut_after_three_hours_of_agreement ... ok
+test model::vol::tests::windowed_results_equal_the_full_scan ... ok
+test model::vol::tests::ewma_close_to_truth ... ok
+test registry::tests::migrations_add_missing_columns ... ok
+test model::exit::tests::formula_matches_simulation ... ok
+test registry::tests::current_rules_follow_the_latest_version_and_rollbacks ... ok
+test registry::tests::policy_follows_keeper_runs ... ok
+test registry::tests::profit_champion_needs_enough_graded_decisions ... ok
+test registry::tests::regime_scores_compare_the_same_hours ... ok
+test registry::tests::shadow_row_made_and_graded ... ok
+test replay::tests::days_replay_every_fixed_width_and_model ... ok
+test replay::tests::replayed_blend_equals_the_live_blend ... ok
+test replay::tests::replays_a_range_and_labels_regimes ... ok
+test rules::tests::choose_with_floor_follows_the_keeper_rule ... ok
+test rules::tests::hysteresis_holds_the_width_until_the_gain_is_clear ... ok
+test rules::tests::scoreboard_ranks_candidates_on_realised_results ... ok
+test store::tests::meta_roundtrip ... ok
+test store::tests::pool_ticks_merge_and_dedup ... ok
+test registry::tests::predict_then_grade ... ok
+test replay::tests::a_new_replay_version_rebuilds_everything ... ok
+test replay::tests::walk_forward_never_uses_the_future ... ok
+
+test result: ok. 82 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 14.89s
+
+
+running 5 tests
+test no_secrets_committed ... ok
+test mail_is_read_only_and_owner_only ... ok
+test no_signing_crates_in_lockfile ... ok
+test web_client_has_no_write_verbs ... ok
+test no_send_or_sign_code_outside_the_guard ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+

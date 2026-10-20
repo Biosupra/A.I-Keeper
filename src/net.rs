@@ -77,10 +77,16 @@ impl Claude {
     }
 }
 
+/// A test-only stand-in for Base: answers each (method, params) in-process (see `Rpc::mock`).
+#[cfg(test)]
+pub type MockChain = std::sync::Arc<dyn Fn(&str, &Value) -> Result<Value> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct Rpc {
     client: reqwest::Client,
     urls: Vec<String>,
+    #[cfg(test)]
+    mock: Option<MockChain>,
 }
 
 impl Rpc {
@@ -93,7 +99,19 @@ impl Rpc {
         }
         let client =
             reqwest::Client::builder().timeout(Duration::from_secs(20)).user_agent("PandaFinancial-AIKeeper/0.1 (watch-only)").build()?;
-        Ok(Rpc { client, urls })
+        Ok(Rpc {
+            client,
+            urls,
+            #[cfg(test)]
+            mock: None,
+        })
+    }
+
+    /// Tests only: an Rpc whose calls are answered by `chain` instead of the network (the method allowlist
+    /// still applies). Nothing in the release binary can build one.
+    #[cfg(test)]
+    pub fn mock(chain: MockChain) -> Self {
+        Rpc { client: reqwest::Client::new(), urls: vec!["https://mainnet.base.org".into()], mock: Some(chain) }
     }
 
     /// One read-only call, trying each endpoint in turn.
@@ -109,6 +127,10 @@ impl Rpc {
     pub async fn batch(&self, calls: &[(&str, Value)]) -> Result<Vec<Result<Value>>> {
         for (m, _) in calls {
             guard::check_rpc_method(m)?;
+        }
+        #[cfg(test)]
+        if let Some(chain) = &self.mock {
+            return Ok(calls.iter().map(|(m, p)| chain(m, p)).collect());
         }
         let body: Vec<Value> =
             calls.iter().enumerate().map(|(i, (m, p))| json!({"jsonrpc": "2.0", "id": i, "method": m, "params": p})).collect();

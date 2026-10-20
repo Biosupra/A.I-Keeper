@@ -88,3 +88,7 @@ roughly 10–15 GB a year, so the disk lasts about two years; an `ai-disk` alert
 Deployed 2026-09-29 on Google Cloud (project `pf-ai-keeper`, VM `aikeeper`). Collectors, six volatility
 models, range-exit models, exact-rules shadow mode, scorecard, alerts, reply reading, daily brief,
 guardrails. What is deliberately not built yet, and why: [docs/ROADMAP.md](docs/ROADMAP.md).
+
+Aero (2026-10-22): the gauge is probed (`AIK_GAUGE_MODE`, Aerodrome or Aero); from the launch Aerodrome's
+rewards count as zero (its gauge keeps reporting a rate it never pays), and the A.I can follow the Aero vault.
+Update steps and variables: [docs/AERO-VM-UPDATE.md](docs/AERO-VM-UPDATE.md).

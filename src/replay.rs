@@ -226,6 +226,44 @@ pub fn days(store: &Store, from: i64, to: i64, now: i64, vault: &str) -> Result<
     let Some(template) = template else {
         bail!("replay needs at least one keeper width table (sync the keeper bucket first)");
     };
+    // Aero (2026-10-22): Aerodrome's rewards end (its gauge keeps reporting a rate it never pays), so from then a
+    // day scored with an Aerodrome table earns no reward. When the followed vault is on Aero, the days from the
+    // launch are scored with its own Aero tables instead (the one at the median volatility), if it has any yet.
+    let on_aero = crate::collect::gauge::vault_on_aero(store, vault);
+    let aerodrome_end = crate::aero::aerodrome_rewards_end(crate::collect::gauge::latest_period_finish(store));
+    // Days replayed by a version without this rule, after Aerodrome's end, counted rewards never paid: replayed
+    // again (once; the days in this run's range now, older ones by `aikeeper replay --days N`).
+    if store.meta_get("replay_aerodrome_end")?.is_none() {
+        store.db.execute("DELETE FROM replay_day WHERE day + 86400 > ?1", [aerodrome_end])?;
+        store.meta_set("replay_aerodrome_end", &aerodrome_end.to_string())?;
+    }
+    let aero_template: Option<shadow::Table> = if on_aero {
+        let mut st = store.db.prepare(
+            "SELECT ts, CAST(json_extract(json, '$.realised_vol_hourly') AS REAL) FROM keeper_rows
+             WHERE tbl = 'width_evals' AND vault = ?1 AND ts >= ?2 AND json_extract(json, '$.realised_vol_hourly') IS NOT NULL",
+        )?;
+        let mut v: Vec<(i64, f64)> =
+            st.query_map(params![vault, crate::aero::LAUNCH_TS], |r| Ok((r.get(0)?, r.get(1)?)))?.filter_map(|x| x.ok()).collect();
+        v.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let mid = v.len() / 2;
+        let mut found = None;
+        for k in 0..v.len() {
+            let i = if k % 2 == 0 { mid + k / 2 } else { mid.wrapping_sub(k / 2 + 1) };
+            let Some(&(ts, _)) = v.get(i) else { continue };
+            let raw: String = store.db.query_row(
+                "SELECT json FROM keeper_rows WHERE tbl = 'width_evals' AND vault = ?1 AND ts = ?2 LIMIT 1",
+                params![vault, ts],
+                |r| r.get(0),
+            )?;
+            found = serde_json::from_str(&raw).ok().and_then(|v| shadow::Table::from_keeper(&v));
+            if found.is_some() {
+                break;
+            }
+        }
+        found
+    } else {
+        None
+    };
 
     let prices = store.prices("coinbase", from - 3 * 86_400, to + 2 * 86_400)?;
     // The pool measures calmer than Coinbase (a basis gap, see registry::make_shadow): the models'
@@ -272,6 +310,9 @@ pub fn days(store: &Store, from: i64, to: i64, now: i64, vault: &str) -> Result<
         "pool_fee_pips": fee, "vol_basis_pool_over_coinbase": basis, "basis_samples": vols.len().div_ceil(step),
         "keeper_tables_available": vols.len(), "policy": policy,
         "note": "prices, exits, clocks, costs and divergence are real; emissions, gas and the pool fee are the levels measured since the vault launched",
+        "gauge_mode": if on_aero { "aero" } else { "aerodrome" },
+        "aerodrome_rewards_end": aerodrome_end,
+        "aero_template_table_ts": aero_template.as_ref().map(|t| t.ts),
     });
 
     let mut out = DaySummary::default();
@@ -288,13 +329,20 @@ pub fn days(store: &Store, from: i64, to: i64, now: i64, vault: &str) -> Result<
         let day_vol = vol::realised(&prices, d, d + 86_400);
         let prior_vol = vol::realised(&prices, d - 86_400, d);
         let mut rows: Vec<(String, shadow::Replay)> = Vec::new();
+        // The day's table: the Aero one from the launch when the vault is on Aero, else the template, whose
+        // Aerodrome rewards count as zero from their end.
+        let (template, rewards_end) = match &aero_template {
+            Some(t) if d >= crate::aero::LAUNCH_TS => (t, None),
+            _ => (&template, Some(aerodrome_end)),
+        };
         // Fixed widths: the template table, in force from before the day starts.
         let mut t0 = template.clone();
         t0.ts = d - 1;
         let fixed_hour = shadow::Hour { nets: t0.rows.iter().map(|r| (r.h as i64, r.net)).collect(), choice: t0.choice, table: t0.clone() };
+        let fixed_hours = registry::without_phantom_rewards(vec![fixed_hour], rewards_end);
         for r in &template.rows {
             let w = r.h as i64;
-            if let Some(res) = shadow::replay(&policy, std::slice::from_ref(&fixed_hour), &path, d, 86_400, Some(w)) {
+            if let Some(res) = shadow::replay(&policy, &fixed_hours, &path, d, 86_400, Some(w)) {
                 rows.push((format!("fixed:{w}"), res));
             }
         }
@@ -311,7 +359,7 @@ pub fn days(store: &Store, from: i64, to: i64, now: i64, vault: &str) -> Result<
                     Some(shadow::Hour { table: t, nets, choice })
                 })
                 .collect();
-            if let Some(hours) = hours {
+            if let Some(hours) = hours.map(|h| registry::without_phantom_rewards(h, rewards_end)) {
                 if let Some(res) = shadow::replay(&policy, &hours, &path, d, 86_400, None) {
                     rows.push((m.to_string(), res));
                 }
@@ -431,6 +479,17 @@ pub fn the_past(store: &Store, now: i64) -> Result<Option<String>> {
         "\nTHE PAST, REPLAYED ({n_days} days since {first}: every model and width on every day, using only what it could have seen then)"
     )?;
 
+    let assumed: Option<String> =
+        store.db.query_row("SELECT assumptions FROM replay_runs WHERE kind = 'days' ORDER BY ts DESC LIMIT 1", [], |r| r.get(0)).ok();
+    if let Some(a) = assumed.and_then(|a| serde_json::from_str::<serde_json::Value>(&a).ok()).filter(|a| a["gauge_mode"].is_string()) {
+        let end = a["aerodrome_rewards_end"].as_i64().map(date).unwrap_or_default();
+        writeln!(
+            b,
+            "  Replayed in gauge mode {}: days scored with an Aerodrome table earn no reward from {end} (Aerodrome's rewards ended){}",
+            a["gauge_mode"].as_str().unwrap_or("?"),
+            if a["aero_template_table_ts"].is_i64() { "; days from the Aero launch use the vault's own Aero table" } else { "" }
+        )?;
+    }
     // Which forecaster to trust in which market (paired: the same hours for every model).
     for (regime, ms) in &fc {
         let best = &ms[0];
@@ -688,5 +747,61 @@ mod tests {
         // The brief's section reads it all back.
         let text = the_past(&s, now).unwrap().unwrap();
         assert!(text.contains("THE PAST, REPLAYED") && text.contains("Widths,") && text.contains("Worst days"), "{text}");
+    }
+
+    /// Replays the days around the Aero launch; returns (day, strategy, revenue) and the run's assumptions.
+    fn days_around_launch(on_aero: bool) -> (Vec<(i64, String, f64)>, serde_json::Value) {
+        let launch = crate::aero::LAUNCH_TS;
+        let s = Store::memory().unwrap();
+        let start = launch - 40 * 86_400;
+        for (t, p) in gbm(start, 45 * 1440, 0.005, 42) {
+            s.put_price("coinbase", t, p, None, None, None).unwrap();
+        }
+        let now = start + 45 * 86_400;
+        let vault = crate::collect::bucket::PRIMARY_DEFAULT;
+        let table = std::fs::read_to_string("tests/fixtures/width_evals.json").unwrap();
+        s.db.execute(
+            "INSERT INTO keeper_rows (obj, line, tbl, ts, json, vault) VALUES ('t', 0, 'width_evals', ?1, ?2, 'old')",
+            params![launch - 5 * 86_400, table.trim()],
+        )
+        .unwrap();
+        if on_aero {
+            s.meta_set("gauge_mode", "aero").unwrap();
+            s.meta_set("gauge_mode_vault", vault).unwrap();
+            let mut v: serde_json::Value = serde_json::from_str(&table).unwrap();
+            v["ts"] = json!(launch + 3600);
+            s.db.execute(
+                "INSERT INTO keeper_rows (obj, line, tbl, ts, json, vault) VALUES ('a', 0, 'width_evals', ?1, ?2, ?3)",
+                params![launch + 3600, v.to_string(), vault],
+            )
+            .unwrap();
+        }
+        forecasts(&s, launch - 4 * 86_400, launch + 3 * 86_400, now).unwrap();
+        days(&s, launch - 2 * 86_400, launch + 2 * 86_400, now, vault).unwrap();
+        let rows: Vec<(i64, String, f64)> = {
+            let mut st = s.db.prepare("SELECT day, strategy, revenue FROM replay_day ORDER BY day, strategy").unwrap();
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().map(|r| r.unwrap()).collect()
+        };
+        let a: String = s.db.query_row("SELECT assumptions FROM replay_runs", [], |r| r.get(0)).unwrap();
+        (rows, serde_json::from_str(&a).unwrap())
+    }
+
+    #[test]
+    fn replayed_days_after_the_launch_earn_no_aerodrome_rewards() {
+        let launch = crate::aero::LAUNCH_TS;
+        let (rows, a) = days_around_launch(false);
+        let before: Vec<&(i64, String, f64)> = rows.iter().filter(|r| r.0 < launch).collect();
+        let after: Vec<&(i64, String, f64)> = rows.iter().filter(|r| r.0 >= launch).collect();
+        assert!(!before.is_empty() && !after.is_empty(), "{rows:?}");
+        assert!(after.iter().any(|r| !r.1.starts_with("fixed:")), "the models are replayed after the launch too");
+        assert!(before.iter().filter(|r| r.1 == "fixed:4").all(|r| r.2 > 0.0), "before: the table's rewards");
+        assert!(after.iter().all(|r| r.2 == 0.0), "after: no Aerodrome rewards, fixed widths and models alike: {after:?}");
+        assert_eq!(a["gauge_mode"], "aerodrome");
+        assert_eq!(a["aerodrome_rewards_end"], launch);
+        // On Aero, the days from the launch are scored with the vault's own Aero table: rewards again.
+        let (rows, a) = days_around_launch(true);
+        assert!(rows.iter().filter(|r| r.0 >= launch && r.1 == "fixed:4").all(|r| r.2 > 0.0), "{rows:?}");
+        assert_eq!(a["gauge_mode"], "aero");
+        assert_eq!(a["aero_template_table_ts"], launch + 3600);
     }
 }

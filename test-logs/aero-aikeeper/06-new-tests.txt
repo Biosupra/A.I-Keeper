@@ -1,0 +1,26 @@
+Before (46b514a): 82 passed + 1 ignored (unit) and 5 guardrail tests. After: see 03-cargo-test.log.
+
+New tests (all 'ok' in 03-cargo-test.log):
+test aero::tests::aero_decode_gauge_states_penalty_struct_and_arrays
+test aero::tests::rate_changes_caps_referrals_claims_and_the_window_are_handled
+test aero::tests::the_aero_price_falls_back_to_the_aerodrome_pool_only_in_aero_mode
+test aero::tests::the_end_of_aerodrome_rewards_for_replays
+test aero::tests::the_launch_is_thursday_2026_10_22_midnight_utc
+test aero::tests::the_on_chain_rate_and_the_measured_rate_agree_on_a_mock_that_follows_aeros_maths
+test aero::tests::the_phantom_rule_zeroes_the_rate_at_and_after_period_finish
+test aero::tests::the_probe_picks_the_gauge_by_what_answers_and_refuses_the_rest
+test aero::tests::the_window_is_blocks_only_zero_today_and_whatever_the_admin_sets_later
+test alerts::tests::a_refused_gauge_setting_is_an_alert_until_the_probe_succeeds
+test brief::tests::the_short_version_says_when_aerodrome_pays_nothing_and_checks_aeros_rate
+test collect::bucket::tests::position_snapshots_keep_the_gauge_earned_and_deposit_block
+test collect::chain::tests::the_pool_read_in_each_mode_and_the_aero_price_either_way_round
+test collect::gauge::tests::every_aero_read_matches_the_verified_abis
+test collect::gauge::tests::replays_end_aerodrome_rewards_at_the_last_period_and_never_on_aero
+test collect::gauge::tests::the_probe_resolves_each_gauge_and_refuses_a_wrong_setting
+test collect::gauge::tests::the_selftest_passes_in_both_modes_with_mocks
+test collect::liquidity::tests::the_emission_snapshot_in_each_mode
+test registry::tests::comparisons_after_the_launch_count_no_aerodrome_rewards_and_keep_every_decision
+test registry::tests::phantom_rewards_are_cut_at_the_end_and_nothing_else_changes
+test replay::tests::replayed_days_after_the_launch_earn_no_aerodrome_rewards
+
+Tests removed: 0

@@ -18,7 +18,8 @@
 //! * the A.I itself: its Base reads, its pool-event feed, its liquidity map, its market data or its
 //!   bucket access stalling, and its database approaching the disk budget;
 //! * rule drift (the live vault's keeper, AIK_PRIMARY_VAULT): the keeper choosing a width the A.I's copy of its rules would not (its rules have
-//!   changed and the shadow replay needs updating).
+//!   changed and the shadow replay needs updating);
+//! * the gauge setting: AIK_GAUGE / AIK_GAUGE_MODE refused by the probe (`collect::gauge`).
 
 use crate::config::Config;
 use crate::net::{Rpc, Web};
@@ -128,6 +129,11 @@ pub async fn evaluate(cfg: &Config, store: &Store, web: &Web, rpc: &Rpc, now: i6
                 out.push(f(&format!("site:{path}"), format!("pandafinancial.org{path} is failing (HTTP {status}, twice in a row).")));
             }
         }
+    }
+
+    // The gauge: AIK_GAUGE / AIK_GAUGE_MODE refused by the probe (the gauge is then not read at all).
+    if let Some(g) = gauge_finding(store) {
+        out.push(g);
     }
 
     // The keepers' own history, the A.I's own feeds. Each keeper writes every minute; the A.I reads
@@ -263,6 +269,15 @@ pub async fn evaluate(cfg: &Config, store: &Store, web: &Web, rpc: &Rpc, now: i6
     Ok(out)
 }
 
+/// The gauge probe's refusal (`collect::gauge`), while it lasts.
+fn gauge_finding(store: &Store) -> Option<Finding> {
+    let e = store.meta_get("gauge_mode_error").ok().flatten().filter(|e| !e.is_empty())?;
+    Some(f(
+        "gauge-mode",
+        format!("The A.I is not reading the gauge: {e}. Fix AIK_GAUGE or AIK_GAUGE_MODE in /etc/aikeeper.env and restart the service (the pool and the market are still read)."),
+    ))
+}
+
 /// What to send now, given what is wrong now and what was open before. Pure, so it is unit-tested.
 /// `open` is (key, first_seen, last_sent). Returns (to_send, still_open, resolved).
 #[allow(clippy::type_complexity)]
@@ -337,6 +352,18 @@ pub async fn run(cfg: &Config, store: &Store, web: &Web, rpc: &Rpc, now: i64) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refused_gauge_setting_is_an_alert_until_the_probe_succeeds() {
+        let s = Store::memory().unwrap();
+        assert_eq!(gauge_finding(&s), None);
+        s.meta_set("gauge_mode_error", "AIK_GAUGE_MODE=aero but AIK_GAUGE answers rewardRate()").unwrap();
+        let g = gauge_finding(&s).unwrap();
+        assert_eq!(g.key, "gauge-mode");
+        assert!(g.message.contains("AIK_GAUGE_MODE=aero but"));
+        s.meta_set("gauge_mode_error", "").unwrap(); // what a successful probe records
+        assert_eq!(gauge_finding(&s), None);
+    }
 
     fn fi(k: &str) -> Finding {
         Finding { key: k.into(), message: format!("{k} is wrong") }

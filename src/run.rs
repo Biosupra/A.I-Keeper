@@ -6,7 +6,7 @@
 //! Every job writes to the database only after its network waits, so a job cut off at its limit
 //! leaves nothing half-written.
 
-use crate::collect::{bucket, chain, flow, liquidity, market, news, site};
+use crate::collect::{bucket, chain, flow, gauge, liquidity, market, news, site};
 use crate::config::Config;
 use crate::model::har;
 use crate::net::{Rpc, Web};
@@ -154,11 +154,24 @@ pub async fn daemon(cfg: Config) -> Result<()> {
     let mut alerts_t = Every::new(600);
     let mut inbox_t = Every::new(600);
     let mut bucket_thread: Option<std::thread::JoinHandle<()>> = None;
+    // The gauge is probed once (AIK_GAUGE_MODE); until a probe succeeds no gauge function is read. A probe that
+    // could not reach Base is retried with the next pool read, one the gauge refused at most hourly.
+    let mut gauge_ctx: Option<gauge::GaugeCtx> = None;
+    let mut gauge_refused = false;
+    let mut probe_t = Every::new(3600);
 
     loop {
         let t = now();
         if chain_t.due(t) {
-            bounded("chain", 60, chain::poll(&rpc, &cfg.pool, &cfg.gauge, &store)).await;
+            if gauge_ctx.is_none() && (!gauge_refused || probe_t.due(t)) {
+                probe_t.last = t;
+                if let Some((ctx, refused)) =
+                    bounded("gauge probe", 60, async { Ok(gauge::resolve_and_record(&rpc, &cfg, &store, t).await) }).await
+                {
+                    (gauge_ctx, gauge_refused) = (ctx, refused);
+                }
+            }
+            bounded("chain", 60, chain::poll(&rpc, &cfg.pool, &cfg.gauge, gauge_ctx.as_ref(), &store)).await;
         }
         if flow_t.due(t) {
             // Every pool and gauge event since the last read (catches up up to 3 ranges at a time).
@@ -195,7 +208,7 @@ pub async fn daemon(cfg: Config) -> Result<()> {
             bounded("deribit options", 90, market::options(&web, &store, t)).await;
         }
         if emissions_t.due(t) {
-            bounded("emissions", 90, liquidity::snapshot_emissions(&rpc, &store, &cfg.pool, &cfg.gauge, t)).await;
+            bounded("emissions", 90, liquidity::snapshot_emissions(&rpc, &store, &cfg.pool, &cfg.gauge, gauge_ctx.as_ref(), t)).await;
         }
         if yields_t.due(t) {
             bounded("defillama", 120, market::pool_yields(&web, &store, t)).await;

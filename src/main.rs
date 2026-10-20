@@ -5,6 +5,7 @@
 //! grades itself on what really happened; and emails a daily brief. It holds no key, calls no
 //! write method and cannot change anything anywhere (see `guard.rs` and `docs/GUARDRAILS.md`).
 
+mod aero;
 mod alerts;
 mod brief;
 mod chainmath;
@@ -23,7 +24,7 @@ mod store;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use collect::{bucket, chain, flow, liquidity, market, news, site};
+use collect::{bucket, flow, gauge, liquidity, market, news, site};
 
 #[derive(Parser)]
 #[command(name = "aikeeper", version, about = "Panda Financial A.I Keeper (watch-only)")]
@@ -261,17 +262,10 @@ async fn selftest(cfg: &config::Config, t: i64) -> Result<()> {
     let web = net::Web::new()?;
     let rpc = net::Rpc::new(cfg.rpc_urls.clone())?;
     println!("\nsources:");
-    match chain::poll(&rpc, &cfg.pool, &cfg.gauge, &s).await {
-        Ok(o) => println!(
-            "  Base pool      block {} tick {} (${:.2}) fee {:?} pips, base fee {:?} gwei, emissions {:?} AERO/s",
-            o.block,
-            o.tick,
-            chainmath::tick_to_price(o.tick as f64),
-            o.fee_pips,
-            o.base_fee_gwei,
-            o.reward_rate
-        ),
-        Err(e) => println!("  Base pool      FAILED: {e:#}"),
+    // The gauge (probed: Aerodrome or Aero), the pool and the emission snapshot, in the gauge's mode.
+    let (chain_lines, _) = gauge::selftest_lines(&rpc, cfg, &s, t).await;
+    for l in &chain_lines[..chain_lines.len() - 1] {
+        println!("{l}");
     }
     match market::coinbase_latest(&web, &s, t).await {
         Ok(n) => println!("  Coinbase       {n} one-minute candles"),
@@ -320,9 +314,8 @@ async fn selftest(cfg: &config::Config, t: i64) -> Result<()> {
         Ok(n) => println!("  Liquidity map  {n} initialized ticks within ±20%"),
         Err(e) => println!("  Liquidity map  FAILED: {e:#}"),
     }
-    match liquidity::snapshot_emissions(&rpc, &s, &cfg.pool, &cfg.gauge, t).await {
-        Ok(n) => println!("  Emissions/vote {n} values"),
-        Err(e) => println!("  Emissions/vote FAILED: {e:#}"),
+    if let Some(l) = chain_lines.last() {
+        println!("{l}");
     }
     match site::check_all(&web, &s, &cfg.site, t).await {
         Ok(cs) => {
@@ -390,7 +383,11 @@ async fn backfill(cfg: &config::Config, t: i64, days: i64, eth_days: i64, no_buc
     let _ = market::pool_yields(&web, &s, t).await.map(|n| println!("DefiLlama: {n} Aerodrome pools"));
     let _ = market::options(&web, &s, t).await.map(|n| println!("ETH options: {n} instruments"));
     let _ = liquidity::snapshot_ticks(&rpc, &s, &cfg.pool, t).await.map(|n| println!("Liquidity map: {n} ticks"));
-    let _ = liquidity::snapshot_emissions(&rpc, &s, &cfg.pool, &cfg.gauge, t).await.map(|n| println!("Emissions/vote: {n} values"));
+    let (ctx, _) = gauge::resolve_and_record(&rpc, cfg, &s, t).await;
+    println!("Gauge mode: {}", ctx.as_ref().map(|c| c.mode.name()).unwrap_or("unknown (the gauge is not read)"));
+    let _ = liquidity::snapshot_emissions(&rpc, &s, &cfg.pool, &cfg.gauge, ctx.as_ref(), t)
+        .await
+        .map(|n| println!("Emissions/vote: {n} values"));
     let _ = news::poll(&web, &s, t).await.map(|(f, n)| println!("News: {n} headlines from {f} feeds"));
     match model::har::refit(&s, t)? {
         Some(h) => println!("HAR fitted on {} days: {:?}", h.n, h),

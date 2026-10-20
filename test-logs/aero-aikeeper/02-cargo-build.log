@@ -1,0 +1,4 @@
+$ cargo build
+   Compiling aikeeper v0.1.0 (/home/user/repo)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.62s
+exit=0

@@ -1,0 +1,3 @@
+$ cargo clippy --all-targets   (at 46b514a)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 18.33s
+exit=0

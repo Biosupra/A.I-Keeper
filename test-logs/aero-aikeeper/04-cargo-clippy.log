@@ -1,0 +1,4 @@
+$ cargo clippy --all-targets
+    Checking aikeeper v0.1.0 (/home/user/repo)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.67s
+exit=0

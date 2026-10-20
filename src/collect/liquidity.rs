@@ -5,8 +5,15 @@
 //!   liquidity. Staked liquidity is what shares the gauge's AERO with the vault.
 //! * every hour, the emission schedule and the vote: gauge.periodFinish/left/rewardRateByEpoch,
 //!   the pool's rewardReserve and gaugeFees, the Voter's weight for this pool and the total weight,
-//!   and the keeper wallet's ETH balance.
-use crate::chainmath::{encode_i64_word, selector, word_i64, word_signed_dec, word_u128, word_unsigned_dec, words};
+//!   and the keeper wallet's ETH balance. On Aerodrome's gauge the epoch rate is also stored as it is
+//!   really paid (0 once periodFinish has passed and from the Aero launch), next to the raw one.
+//! * on Aero's gauge instead (no periodFinish/left/rewardRateByEpoch, no Aerodrome vote): the LeafVoter's
+//!   gauge state and emissionsPerVP, the gauge factory's cap, referral cut and early-unstake window
+//!   (`effectivePenaltyConfig`, in BLOCKS), and the followed vault's staked NFTs with each one's
+//!   `depositBlock` and the gauge's `earned(vault, ids)` sum.
+use crate::aero::{self, GaugeMode};
+use crate::chainmath::{encode_i64_word, selector, word_address, word_i64, word_signed_dec, word_u128, word_unsigned_dec, words};
+use crate::collect::gauge::GaugeCtx;
 use crate::net::Rpc;
 use crate::store::Store;
 use anyhow::{anyhow, bail, Result};
@@ -102,24 +109,49 @@ pub fn profile(store: &Store, ts: i64, current_tick: i64, active: f64, staked: f
 }
 
 /// The emission schedule, the vote and the keeper wallet (hourly). Returns how many values were stored.
-pub async fn snapshot_emissions(rpc: &Rpc, store: &Store, pool: &str, gauge: &str, ts: i64) -> Result<usize> {
-    let epoch_start = ts - ts.rem_euclid(604_800); // Aerodrome epochs start Thursday 00:00 UTC (unix epoch was a Thursday)
-    let calls = vec![
-        call(gauge, selector("periodFinish()")),
-        call(gauge, selector("left()")),
-        call(gauge, format!("{}{:064x}", selector("rewardRateByEpoch(uint256)"), epoch_start)),
-        call(gauge, selector("fees0()")),
-        call(gauge, selector("fees1()")),
-        call(pool, selector("rewardReserve()")),
+/// `ctx` None (the gauge not probed yet): only the pool and the keeper wallet are read.
+pub async fn snapshot_emissions(rpc: &Rpc, store: &Store, pool: &str, gauge: &str, ctx: Option<&GaugeCtx>, ts: i64) -> Result<usize> {
+    let mut calls = vec![
         call(pool, selector("gaugeFees()")),
         call(pool, selector("stakedLiquidity()")),
         call(pool, selector("liquidity()")),
-        call(VOTER, format!("{}{}", selector("weights(address)"), arg_addr(pool))),
-        call(VOTER, selector("totalWeight()")),
         ("eth_getBalance", json!([KEEPER_WALLET, "latest"])),
     ];
+    let mode = ctx.map(|c| c.mode);
+    let g = arg_addr(gauge);
+    match mode {
+        Some(GaugeMode::Aerodrome) => {
+            let epoch_start = ts - ts.rem_euclid(604_800); // Aerodrome epochs start Thursday 00:00 UTC (unix epoch was a Thursday)
+            calls.extend([
+                call(gauge, selector("periodFinish()")),
+                call(gauge, selector("left()")),
+                call(gauge, format!("{}{:064x}", selector("rewardRateByEpoch(uint256)"), epoch_start)),
+                call(gauge, selector("fees0()")),
+                call(gauge, selector("fees1()")),
+                call(pool, selector("rewardReserve()")),
+                call(VOTER, format!("{}{}", selector("weights(address)"), arg_addr(pool))),
+                call(VOTER, selector("totalWeight()")),
+            ]);
+        }
+        Some(GaugeMode::Aero) => {
+            let c = ctx.expect("mode");
+            calls.extend([
+                call(&c.voter, format!("{}{g}", selector("gaugeStates(address)"))),
+                call(&c.voter, selector("emissionsPerVP()")),
+                call(&c.factory, format!("{}{g}", selector("effectivePenaltyConfig(address)"))),
+                call(&c.factory, format!("{}{g}", selector("emissionCap(address)"))),
+                call(&c.factory, format!("{}{g}", selector("referralConfig(address)"))),
+            ]);
+            if let Some(v) = &c.vault {
+                calls.push(call(gauge, format!("{}{}", selector("stakedValues(address)"), arg_addr(v))));
+                calls.push(call(gauge, format!("{}{}", selector("deferredEmissions(address)"), arg_addr(v))));
+            }
+        }
+        None => {}
+    }
     let out = rpc.batch(&calls).await?;
     let num = |i: usize, scale: f64| -> Option<f64> { ok_str(&out[i]).and_then(|s| words(s).first().map(|w| word_u128(w) as f64 / scale)) };
+    let all = |i: usize| -> Option<Vec<String>> { ok_str(&out[i]).map(words).filter(|w| !w.is_empty()) };
     let mut n = 0;
     let mut put = |key: &str, v: Option<f64>| -> Result<()> {
         if let Some(v) = v {
@@ -128,32 +160,103 @@ pub async fn snapshot_emissions(rpc: &Rpc, store: &Store, pool: &str, gauge: &st
         }
         Ok(())
     };
-    put("period_finish", num(0, 1.0))?;
-    put("left_aero", num(1, 1e18))?;
-    put("reward_rate_epoch_aero_s", num(2, 1e18))?;
-    put("fees0_weth", num(3, 1e18))?;
-    put("fees1_usdc", num(4, 1e6))?;
-    put("pool_reward_reserve_aero", num(5, 1e18))?;
-    if let Some(w) = ok_str(&out[6]).map(words) {
+    if let Some(w) = all(0) {
         if w.len() >= 2 {
             put("pool_gauge_fees0_weth", Some(word_u128(&w[0]) as f64 / 1e18))?;
             put("pool_gauge_fees1_usdc", Some(word_u128(&w[1]) as f64 / 1e6))?;
         }
     }
-    put("pool_staked_liquidity", num(7, 1.0))?;
-    put("pool_liquidity", num(8, 1.0))?;
-    let (weight, total) = (num(9, 1e18), num(10, 1e18));
-    put("voter_weight", weight)?;
-    put("voter_total_weight", total)?;
-    if let (Some(w), Some(t)) = (weight, total) {
-        if t > 0.0 {
-            put("voter_share", Some(w / t))?;
+    put("pool_staked_liquidity", num(1, 1.0))?;
+    put("pool_liquidity", num(2, 1.0))?;
+    let mut staked_ids: Vec<u128> = Vec::new();
+    match mode {
+        Some(GaugeMode::Aerodrome) => {
+            let finish = num(4, 1.0).map(|f| f as i64);
+            put("period_finish", finish.map(|f| f as f64))?;
+            put("left_aero", num(5, 1e18))?;
+            let epoch_rate = num(6, 1e18);
+            put("reward_rate_epoch_aero_s", epoch_rate)?;
+            // What that rate really pays: nothing once periodFinish has passed, and nothing from the Aero launch.
+            put("reward_rate_epoch_effective_aero_s", epoch_rate.map(|r| aero::aerodrome_rate_effective(r, finish, ts)))?;
+            put("aerodrome_paying", Some(if aero::aerodrome_paying(finish, ts) { 1.0 } else { 0.0 }))?;
+            put("fees0_weth", num(7, 1e18))?;
+            put("fees1_usdc", num(8, 1e6))?;
+            put("pool_reward_reserve_aero", num(9, 1e18))?;
+            let (weight, total) = (num(10, 1e18), num(11, 1e18));
+            put("voter_weight", weight)?;
+            put("voter_total_weight", total)?;
+            if let (Some(w), Some(t)) = (weight, total) {
+                if t > 0.0 {
+                    put("voter_share", Some(w / t))?;
+                }
+            }
         }
+        Some(GaugeMode::Aero) => {
+            let state = all(4).and_then(|w| aero::decode_gauge_state(&w));
+            let per_vp = num(5, 1.0);
+            let window = all(6).and_then(|w| aero::decode_penalty_config(&w));
+            let cap = num(7, 1.0);
+            let referral = all(8).filter(|w| w.len() >= 2).map(|w| (word_address(&w[0]), word_u128(&w[1]) as f64));
+            if let Some(s) = state {
+                put("aero_registered", Some(f64::from(u8::from(s.is_registered))))?;
+                put("aero_activated", Some(f64::from(u8::from(s.is_activated))))?;
+                let weight = s.point.permanent_stake_balance as f64 + s.point.bias as f64
+                    - s.point.slope as f64 * (ts - s.point.ts as i64).max(0) as f64;
+                put("aero_gauge_weight", Some(weight.max(0.0) / 1e18))?;
+            }
+            put("aero_emissions_per_vp", per_vp)?;
+            put("aero_emission_cap_aero_s", cap.map(|c| c / 1e18))?;
+            if let Some((referrer, share)) = &referral {
+                put(
+                    "aero_referral_share_pips",
+                    Some(if referrer.trim_start_matches("0x").chars().all(|c| c == '0') { 0.0 } else { *share }),
+                )?;
+            }
+            // The early-unstake window, in blocks (0 = none). Never turned into seconds.
+            if let Some(w) = window {
+                put("aero_min_stake_blocks", Some(w.min_stake_blocks as f64))?;
+                put("aero_penalty_rate_pips", Some(w.penalty_rate_pips as f64))?;
+            }
+            if ctx.and_then(|c| c.vault.as_ref()).is_some() {
+                if let Some(ids) = all(9).and_then(|w| aero::decode_uint_array(&w)) {
+                    put("aero_vault_staked_nfts", Some(ids.len() as f64))?;
+                    staked_ids = ids;
+                }
+                put("aero_vault_deferred_aero", num(10, 1e18))?;
+            }
+        }
+        None => {}
     }
-    let bal = out[11].as_ref().ok().and_then(Value::as_str).and_then(|s| u128::from_str_radix(s.trim_start_matches("0x"), 16).ok());
+    let bal = out[3].as_ref().ok().and_then(Value::as_str).and_then(|s| u128::from_str_radix(s.trim_start_matches("0x"), 16).ok());
     if let Some(b) = bal {
         store.put_series("keeper", "wallet_eth", ts, b as f64 / 1e18)?;
         n += 1;
+    }
+
+    // Aero: each staked NFT's deposit block (the window counts from it) and the gauge's earned SUM over them.
+    if let (Some(c), false) = (ctx.filter(|c| c.mode == GaugeMode::Aero), staked_ids.is_empty()) {
+        let vault = c.vault.as_deref().expect("ids come from the vault");
+        let mut calls: Vec<(&str, Value)> =
+            staked_ids.iter().map(|id| call(gauge, format!("{}{id:064x}", selector("depositBlock(uint256)")))).collect();
+        calls.push(call(gauge, aero::earned_array_call(vault, &staked_ids)));
+        let out = rpc.batch(&calls).await?;
+        let tx = store.write_tx()?;
+        for (id, r) in staked_ids.iter().zip(&out) {
+            if let Some(b) = ok_str(r).and_then(|s| words(s).first().map(|w| word_u128(w) as i64)) {
+                tx.execute(
+                    "INSERT OR REPLACE INTO aero_stakes (token_id, deposit_block, ts) VALUES (?1, ?2, ?3)",
+                    params![*id as i64, b, ts],
+                )?;
+            }
+        }
+        tx.commit()?;
+        // earned(vault, ids) = the sum over the ids PLUS the vault's deferredEmissions: stored without the latter.
+        let sum = ok_str(&out[staked_ids.len()]).and_then(|s| words(s).first().map(|w| word_u128(w) as f64 / 1e18));
+        let deferred = store.series_at("gauge", "aero_vault_deferred_aero", ts)?.filter(|(t, _)| *t == ts).map(|(_, v)| v).unwrap_or(0.0);
+        if let Some(sum) = sum {
+            store.put_series("gauge", "aero_vault_earned_aero", ts, (sum - deferred).max(0.0))?;
+            n += 1;
+        }
     }
     Ok(n)
 }
@@ -180,6 +283,64 @@ mod tests {
         assert_eq!(at(-100), (10.0, 5.0), "[-100,0) only the first");
         assert_eq!(at(100), (4.0, 0.0), "[100,200) only the second");
         assert_eq!(at(200), (0.0, 0.0), "above 200 nothing");
+    }
+
+    #[tokio::test]
+    async fn the_emission_snapshot_in_each_mode() {
+        use crate::collect::gauge::resolve;
+        use crate::collect::gauge::tests::{cfg, MockBase, GAUGE, POOL};
+        let t = aero::LAUNCH_TS + 3600;
+        // Aerodrome after the launch: the raw epoch rate is kept, the effective one is 0.
+        let s = Store::memory().unwrap();
+        let rpc = MockBase::aerodrome(aero::LAUNCH_TS).rpc();
+        let ctx = resolve(&rpc, &cfg("auto", None)).await.unwrap().unwrap();
+        snapshot_emissions(&rpc, &s, POOL, GAUGE, Some(&ctx), t).await.unwrap();
+        let v = |k: &str| s.series_at("gauge", k, t).unwrap().map(|x| x.1);
+        assert_eq!(v("reward_rate_epoch_aero_s"), Some(0.503));
+        assert_eq!(v("reward_rate_epoch_effective_aero_s"), Some(0.0));
+        assert_eq!(v("aerodrome_paying"), Some(0.0));
+        assert_eq!(v("period_finish"), Some(aero::LAUNCH_TS as f64));
+        assert_eq!(v("voter_share"), Some(0.02));
+        // Before periodFinish (and before the launch) the epoch rate is paid.
+        let s2 = Store::memory().unwrap();
+        snapshot_emissions(&MockBase::aerodrome(aero::LAUNCH_TS).rpc(), &s2, POOL, GAUGE, Some(&ctx), aero::LAUNCH_TS - 3600)
+            .await
+            .unwrap();
+        assert_eq!(s2.series_at("gauge", "reward_rate_epoch_effective_aero_s", aero::LAUNCH_TS).unwrap().map(|x| x.1), Some(0.503));
+        // Aero: the voter state, the window in blocks (0 on Base at launch), the referral cut, the staked NFTs with
+        // their deposit blocks, and earned(vault, ids) without the vault's deferred emissions.
+        let s = Store::memory().unwrap();
+        let base = MockBase::aero();
+        let calls = base.calls.clone();
+        let rpc = base.rpc();
+        let ctx = resolve(&rpc, &cfg("auto", None)).await.unwrap().unwrap();
+        calls.lock().unwrap().clear();
+        snapshot_emissions(&rpc, &s, POOL, GAUGE, Some(&ctx), t).await.unwrap();
+        let v = |k: &str| s.series_at("gauge", k, t).unwrap().map(|x| x.1);
+        assert_eq!(v("aero_activated"), Some(1.0));
+        assert_eq!(v("aero_gauge_weight"), Some(1_000_000.0));
+        assert_eq!(v("aero_min_stake_blocks"), Some(0.0));
+        assert_eq!(v("aero_penalty_rate_pips"), Some(1_000_000.0));
+        assert_eq!(v("aero_referral_share_pips"), Some(50_000.0));
+        assert_eq!(v("aero_emission_cap_aero_s"), Some(0.1));
+        assert_eq!(v("aero_vault_staked_nfts"), Some(2.0));
+        assert_eq!(v("aero_vault_deferred_aero"), Some(1.0));
+        assert_eq!(v("aero_vault_earned_aero"), Some(2.5), "earned(vault, [7, 9]) = 3.5: the sum, less the 1.0 deferred");
+        assert_eq!(v("period_finish"), None);
+        let blocks: Vec<(i64, i64)> = {
+            let mut st = s.db.prepare("SELECT token_id, deposit_block FROM aero_stakes ORDER BY token_id").unwrap();
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(blocks, vec![(7, 52_900_000), (9, 52_900_000)]);
+        {
+            let calls = calls.lock().unwrap();
+            for sig in ["periodFinish()", "left()", "rewardRateByEpoch(uint256)", "rewardRate()", "weights(address)"] {
+                assert!(!calls.iter().any(|c| c.1 == selector(sig)), "{sig} is not read in Aero mode");
+            }
+        }
+        // Not probed yet: only the pool and the wallet.
+        let s = Store::memory().unwrap();
+        assert_eq!(snapshot_emissions(&MockBase::aero().rpc(), &s, POOL, GAUGE, None, t).await.unwrap(), 5);
     }
 
     #[test]

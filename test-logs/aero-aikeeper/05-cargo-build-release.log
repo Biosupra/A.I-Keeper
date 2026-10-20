@@ -1,0 +1,4 @@
+$ cargo build --release
+   Compiling aikeeper v0.1.0 (/home/user/repo)
+    Finished `release` profile [optimized] target(s) in 29.85s
+exit=0

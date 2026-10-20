@@ -285,6 +285,37 @@ pub fn resolve(store: &Store, now: i64) -> Result<usize> {
     Ok(graded)
 }
 
+/// Rewards that were never paid count as zero: from `end` (Aerodrome's end, `gauge::rewards_end_for`) every
+/// hour's table pays no reward (its gross APR is 0), while the scores and choices each strategy acts on stay the
+/// keeper's own, unchanged: the width rules are not touched, only what was really earned. The hour in force at
+/// `end` is split there, so not a minute after it is counted. `end` None (an Aero vault) changes nothing.
+pub fn without_phantom_rewards(mut hours: Vec<shadow::Hour>, end: Option<i64>) -> Vec<shadow::Hour> {
+    let Some(end) = end else { return hours };
+    if let Some(i) = hours.iter().rposition(|h| h.table.ts < end) {
+        if hours.get(i + 1).map(|n| n.table.ts != end).unwrap_or(true) {
+            let mut split = hours[i].clone();
+            split.table.ts = end;
+            hours.insert(i + 1, split);
+        }
+    }
+    for h in hours.iter_mut().filter(|h| h.table.ts >= end) {
+        for r in &mut h.table.rows {
+            r.gross_apr = 0.0;
+        }
+    }
+    hours
+}
+
+/// The gauge mode a graded window ending at `to` ran in: 'aero', 'aerodrome', or 'aerodrome-ended' when
+/// Aerodrome's rewards ended before its end (they count as zero from then).
+pub fn window_gauge_mode(end: Option<i64>, to: i64) -> &'static str {
+    match end {
+        None => "aero",
+        Some(e) if e < to => "aerodrome-ended",
+        Some(_) => "aerodrome",
+    }
+}
+
 /// A vault's keeper's rebalance policy as its most recent start at or before `t` logged it.
 pub fn policy_at(store: &Store, t: i64, vault: &str) -> Result<shadow::Policy> {
     let raw: Option<String> = store
@@ -329,7 +360,10 @@ pub fn grade_shadow(store: &Store, made: i64) -> Result<Option<()>> {
     }
     let path = store.pool_path(made - 600, end)?;
     let policy = policy_at(store, made, &vault)?;
-    let keeper_hours = shadow::hours_for(&tables, None, &policy);
+    // Aerodrome's rewards after they ended were never paid (its gauge still reports a rate): counted as zero.
+    let rewards_end = crate::collect::gauge::rewards_end_for(store, &vault);
+    let gauge_mode = window_gauge_mode(rewards_end, end);
+    let keeper_hours = without_phantom_rewards(shadow::hours_for(&tables, None, &policy), rewards_end);
     let Some(keeper) = shadow::replay(&policy, &keeper_hours, &path, made, 86_400, None) else { return Ok(None) };
 
     // The NEW rules (keeper WIDTH_MODE=regime) on the same window, in dollars, next to what the table
@@ -349,8 +383,8 @@ pub fn grade_shadow(store: &Store, made: i64) -> Result<Option<()>> {
     let vols = crate::model::regime::VolPath::new(&long_path);
     if let Some(new) = crate::model::regime::replay(&rp, &policy, &keeper_hours, &path, &vols, made, 86_400) {
         store.db.execute(
-            "INSERT OR REPLACE INTO rules_compare (made_ts, vault, live_mode, old_end, old_rewards, old_moves, old_in_range, new_end, new_rewards, new_moves, new_in_range)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT OR REPLACE INTO rules_compare (made_ts, vault, live_mode, old_end, old_rewards, old_moves, old_in_range, new_end, new_rewards, new_moves, new_in_range, gauge_mode)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 made,
                 vault,
@@ -362,7 +396,8 @@ pub fn grade_shadow(store: &Store, made: i64) -> Result<Option<()>> {
                 new.usd_end,
                 new.usd_rewards,
                 new.rebalances + new.recuts,
-                new.in_range_fraction
+                new.in_range_fraction,
+                gauge_mode
             ],
         )?;
     }
@@ -394,7 +429,7 @@ pub fn grade_shadow(store: &Store, made: i64) -> Result<Option<()>> {
                 t.vol * ratio
             })
             .collect();
-        let hours = shadow::hours_for(&tables, Some(&vols), &policy);
+        let hours = without_phantom_rewards(shadow::hours_for(&tables, Some(&vols), &policy), rewards_end);
         if let Some(r) = shadow::replay(&policy, &hours, &path, made, 86_400, None) {
             store.db.execute(
                 "UPDATE shadow_model SET net_per_day = ?1, replay = ?2 WHERE made_ts = ?3 AND model = ?4",
@@ -413,14 +448,15 @@ pub fn grade_shadow(store: &Store, made: i64) -> Result<Option<()>> {
     let ai_model: String = store.db.query_row("SELECT ai_model FROM shadow WHERE made_ts = ?1", [made], |r| r.get(0))?;
     let ai = model_results.iter().find(|(m, _)| *m == ai_model).map(|(_, r)| r.net_per_day).unwrap_or(keeper.net_per_day);
     store.db.execute(
-        "UPDATE shadow SET keeper_net_per_day = ?1, ai_net_per_day = ?2, best_hindsight = ?3, best_net = ?4, replay = ?5 WHERE made_ts = ?6",
+        "UPDATE shadow SET keeper_net_per_day = ?1, ai_net_per_day = ?2, best_hindsight = ?3, best_net = ?4, replay = ?5, gauge_mode = ?7 WHERE made_ts = ?6",
         params![
             keeper.net_per_day,
             ai,
             best.map(|b| b.0),
             best.map(|b| b.1),
-            json!({ "keeper": keeper, "fixed": fixed, "policy": policy }).to_string(),
-            made
+            json!({ "keeper": keeper, "fixed": fixed, "policy": policy, "gauge_mode": gauge_mode, "rewards_end": rewards_end }).to_string(),
+            made,
+            gauge_mode
         ],
     )?;
     Ok(Some(()))
@@ -816,6 +852,112 @@ mod tests {
         let rep: Value = serde_json::from_str(&rep).unwrap();
         assert_eq!(rep["keeper"]["rebalances"], 0, "a flat day needs no rebalance");
         assert_eq!(rep["policy"]["confirmation_secs"], 21600, "keeper default policy when no keeper_runs row");
+    }
+
+    /// The shadow and rules-compare grading of the first decision in a flat day starting at `ts`, with the keeper's
+    /// hourly table (`vault` 'old', or the followed vault on Aero when `on_aero`): (keeper rewards, new-rules
+    /// rewards, gauge mode, keeper rebalances, model choices).
+    fn graded_around(ts: i64, on_aero: bool) -> (f64, f64, String, i64, Vec<(String, i64)>) {
+        let s = Store::memory().unwrap();
+        let vault = crate::collect::bucket::OLD;
+        if on_aero {
+            s.meta_set("gauge_mode", "aero").unwrap();
+            s.meta_set("gauge_mode_vault", vault).unwrap();
+        }
+        let raw = std::fs::read_to_string("tests/fixtures/width_evals.json").unwrap();
+        let mut v: Value = serde_json::from_str(&raw).unwrap();
+        v["ts"] = json!(ts);
+        let tick = v["current_tick"].as_i64().unwrap();
+        for (t, p) in gbm(ts - 3 * 86_400, 4 * 1440, 0.004, 5) {
+            s.put_price("coinbase", t, p, None, None, None).unwrap();
+        }
+        for i in -4400..1500 {
+            let t = ts / 60 * 60 + i * 60;
+            s.db.execute(
+                "INSERT INTO pool_obs (ts, block, tick, sqrt_price, liquidity, fee_pips, base_fee_gwei, weth_usd) VALUES (?1, 0, ?2, '0', '0', 400, 0.005, 2715.0)",
+                params![t, tick],
+            )
+            .unwrap();
+        }
+        for hour in 0..25 {
+            let mut row = v.clone();
+            row["ts"] = json!(ts + hour * 3600);
+            s.db.execute(
+                "INSERT INTO keeper_rows (obj, line, tbl, ts, json) VALUES (?1, 0, 'width_evals', ?2, ?3)",
+                params![format!("o{hour}"), ts + hour * 3600, row.to_string()],
+            )
+            .unwrap();
+        }
+        assert_eq!(make_shadow(&s, ts + 25 * 3600, vault).unwrap(), 25);
+        grade_shadow(&s, ts).unwrap().expect("the window is covered");
+        let (old, new, mode): (f64, f64, String) =
+            s.db.query_row("SELECT old_rewards, new_rewards, gauge_mode FROM rules_compare WHERE made_ts = ?1", [ts], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        let shadow_mode: String = s.db.query_row("SELECT gauge_mode FROM shadow WHERE made_ts = ?1", [ts], |r| r.get(0)).unwrap();
+        assert_eq!(mode, shadow_mode);
+        let rep: String = s.db.query_row("SELECT replay FROM shadow WHERE made_ts = ?1", [ts], |r| r.get(0)).unwrap();
+        let rep: Value = serde_json::from_str(&rep).unwrap();
+        assert_eq!(rep["gauge_mode"], json!(mode));
+        let choices: Vec<(String, i64)> = {
+            let mut st = s.db.prepare("SELECT model, choice FROM shadow_model WHERE made_ts = ?1 ORDER BY model").unwrap();
+            st.query_map([ts], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(|r| r.unwrap()).collect()
+        };
+        (old, new, mode, rep["keeper"]["rebalances"].as_i64().unwrap(), choices)
+    }
+
+    #[test]
+    fn comparisons_after_the_launch_count_no_aerodrome_rewards_and_keep_every_decision() {
+        let launch = crate::aero::LAUNCH_TS;
+        // A day well before the launch: rewards as the keeper's table pays them.
+        let (old_before, new_before, mode, reb_before, ch_before) = graded_around(launch - 3 * 86_400, false);
+        assert!(old_before > 0.0 && new_before > 0.0, "{old_before} {new_before}");
+        assert_eq!(mode, "aerodrome");
+        // A day that starts 12 h before the launch: only the first 12 hours pay.
+        let (old_mid, new_mid, mode, reb_mid, ch_mid) = graded_around(launch - 12 * 3600, false);
+        assert_eq!(mode, "aerodrome-ended");
+        assert!((old_mid / old_before - 0.5).abs() < 0.01, "{old_mid} vs {old_before}");
+        assert!((new_mid / new_before - 0.5).abs() < 0.01, "{new_mid} vs {new_before}");
+        // A day after the launch: zero Aerodrome rewards in both rule sets, whatever the gauge still reports.
+        let (old_after, new_after, mode, reb_after, ch_after) = graded_around(launch + 3600, false);
+        assert_eq!((old_after, new_after, mode.as_str()), (0.0, 0.0, "aerodrome-ended"));
+        // The decisions are the keeper's own in every case: the width rules are not changed.
+        assert_eq!((reb_before, reb_mid, reb_after), (0, 0, 0));
+        assert_eq!(ch_before, ch_mid);
+        assert_eq!(ch_before, ch_after);
+        // The vault the A.I follows on Aero: its keeper's tables carry Aero's real rate, nothing is zeroed.
+        let (old_aero, new_aero, mode, _, _) = graded_around(launch + 3600, true);
+        assert_eq!(mode, "aero");
+        assert!((old_aero - old_before).abs() < 1e-12 && (new_aero - new_before).abs() < 1e-12);
+    }
+
+    #[test]
+    fn phantom_rewards_are_cut_at_the_end_and_nothing_else_changes() {
+        let raw = std::fs::read_to_string("tests/fixtures/width_evals.json").unwrap();
+        let t = shadow::Table::from_keeper(&serde_json::from_str::<Value>(&raw).unwrap()).unwrap();
+        let p = shadow::Policy::default();
+        let tables: Vec<shadow::Table> = (0..3).map(|i| shadow::Table { ts: 1_000 + i * 3_600, ..t.clone() }).collect();
+        let hours = shadow::hours_for(&tables, None, &p);
+        assert_eq!(without_phantom_rewards(hours.clone(), None).len(), 3, "no end: unchanged");
+        let cut = without_phantom_rewards(hours.clone(), Some(5_000));
+        assert_eq!(cut.iter().map(|h| h.table.ts).collect::<Vec<_>>(), vec![1_000, 4_600, 5_000, 8_200], "split at the end");
+        for h in &cut {
+            let paid = h.table.rows.iter().all(|r| r.gross_apr > 0.0);
+            assert_eq!(paid, h.table.ts < 5_000, "rewards only before the end");
+            let orig = hours.iter().rev().find(|o| o.table.ts <= h.table.ts).unwrap();
+            assert_eq!((&h.nets, h.choice), (&orig.nets, orig.choice), "scores and choices are the keeper's own");
+            assert_eq!(
+                h.table.rows.iter().map(|r| r.rebalances).collect::<Vec<_>>(),
+                orig.table.rows.iter().map(|r| r.rebalances).collect::<Vec<_>>()
+            );
+        }
+        // An end exactly on a table, and an end before every table.
+        assert_eq!(without_phantom_rewards(hours.clone(), Some(4_600)).len(), 3);
+        assert!(without_phantom_rewards(hours, Some(0)).iter().all(|h| h.table.rows.iter().all(|r| r.gross_apr == 0.0)));
+        assert_eq!(window_gauge_mode(None, 10), "aero");
+        assert_eq!(window_gauge_mode(Some(10), 10), "aerodrome");
+        assert_eq!(window_gauge_mode(Some(9), 10), "aerodrome-ended");
     }
 
     #[test]

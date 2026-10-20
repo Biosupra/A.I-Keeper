@@ -230,15 +230,16 @@ pub fn archive(store: &Store, vault: &str, table: &str, obj: &str, gz: &[u8], ro
                 "INSERT OR REPLACE INTO position_min (token_id, ts, origin_token_id, position_usd, hodl_usd, value_minus_hodl_usd,
                    value_plus_returns_minus_hodl_usd, earned_aero_user, paid_aero_cum, paid_usdc_cum, returned_usd, in_range, tick_lower,
                    tick_upper, half_spacings, decision, reason, outside_secs, hold_secs, recut_wait, width_best_hs, width_best_net,
-                   width_current_net, liquidity)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                   width_current_net, liquidity, earned_aero_gross, deposit_block)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
                 params![
                     i(&r["token_id"]), ts, i(&r["origin_token_id"]), f(&r["position_usd"]), f(&r["hodl_usd"]),
                     f(&r["value_minus_hodl_usd"]), f(&r["value_plus_returns_minus_hodl_usd"]), f(&r["earned_aero_user"]),
                     f(&r["paid_aero_cumulative"]), f(&r["paid_usdc_cumulative"]), f(&r["returned_to_owner_usd"]),
                     r["in_range"].as_bool().map(i64::from), i(&r["tick_lower"]), i(&r["tick_upper"]), i(&r["half_spacings"]),
                     s(&r["decision"]), s(&r["reason"]), i(&r["outside_secs"]), i(&r["hold_secs"]), s(&r["recut_wait"]),
-                    i(&r["width_best_hs"]), f(&r["width_best_net_per_day"]), f(&r["width_current_net_per_day"]), s(&r["liquidity"])
+                    i(&r["width_best_hs"]), f(&r["width_best_net_per_day"]), f(&r["width_current_net_per_day"]), s(&r["liquidity"]),
+                    f(&r["earned_aero_gross"]), i(&r["deposit_block"])
                 ],
             )?,
             "keeper_decisions" => tx.execute(
@@ -295,15 +296,16 @@ fn archive_v(store: &Store, vault: &str, table: &str, obj: &str, gz: &[u8], rows
                 "INSERT OR REPLACE INTO position_min (token_id, ts, origin_token_id, position_usd, hodl_usd, value_minus_hodl_usd,
                    value_plus_returns_minus_hodl_usd, earned_aero_user, paid_aero_cum, paid_usdc_cum, returned_usd, in_range, tick_lower,
                    tick_upper, half_spacings, decision, reason, outside_secs, hold_secs, recut_wait, width_best_hs, width_best_net,
-                   width_current_net, liquidity, vault)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+                   width_current_net, liquidity, vault, earned_aero_gross, deposit_block)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
                 params![
                     i(&r["token_id"]), ts, i(&r["origin_token_id"]), f(&r["position_usd"]), f(&r["hodl_usd"]),
                     f(&r["value_minus_hodl_usd"]), f(&r["value_plus_returns_minus_hodl_usd"]), f(&r["earned_aero_user"]),
                     f(&r["paid_aero_cumulative"]), f(&r["paid_b_cumulative"]).or(f(&r["paid_usdc_cumulative"])), f(&r["returned_to_owner_usd"]),
                     r["in_range"].as_bool().map(i64::from), i(&r["tick_lower"]), i(&r["tick_upper"]), i(&r["half_spacings"]),
                     s(&r["decision"]), s(&r["reason"]), i(&r["outside_secs"]), i(&r["hold_secs"]), s(&r["recut_wait"]),
-                    i(&r["width_best_hs"]), f(&r["width_best_net_per_day"]), f(&r["width_current_net_per_day"]), s(&r["liquidity"]), vault
+                    i(&r["width_best_hs"]), f(&r["width_best_net_per_day"]), f(&r["width_current_net_per_day"]), s(&r["liquidity"]), vault,
+                    f(&r["earned_aero_gross"]), i(&r["deposit_block"])
                 ],
             )?,
             "keeper_decisions" => tx.execute(
@@ -543,6 +545,29 @@ mod tests {
             s.db.query_row("SELECT fee_pips, reward_rate FROM keeper_market_min", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
         assert_eq!(fee, 475);
         assert!((reward - 0.5108040683799872).abs() < 1e-15);
+    }
+
+    #[test]
+    fn position_snapshots_keep_the_gauge_earned_and_deposit_block() {
+        // The multi-vault keeper's snapshot (schema 6) carries the gauge's gross `earned` per position and the NFT's
+        // deposit block: the samples of the measured Aero rate.
+        let s = Store::memory().unwrap();
+        let line = std::fs::read_to_string("tests/fixtures/v6/position_snapshots.json").unwrap();
+        let row: Value = serde_json::from_str(line.trim()).unwrap();
+        archive(&s, PRIMARY_DEFAULT, "position_snapshots", "obj", b"", std::slice::from_ref(&row)).unwrap();
+        let (gross, block): (f64, i64) =
+            s.db.query_row("SELECT earned_aero_gross, deposit_block FROM position_min WHERE vault = ?1", [PRIMARY_DEFAULT], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((gross, block), (0.365925422332286, 52_186_831));
+        // The original vault's rows decode the same two fields when they are there, and NULL when not.
+        let line = std::fs::read_to_string("tests/fixtures/position_snapshots.json").unwrap();
+        let row: Value = serde_json::from_str(line.trim()).unwrap();
+        archive(&s, OLD, "position_snapshots", "obj-old", b"", std::slice::from_ref(&row)).unwrap();
+        let gross: Option<f64> =
+            s.db.query_row("SELECT earned_aero_gross FROM position_min WHERE vault = 'old'", [], |r| r.get(0)).unwrap();
+        assert_eq!(gross, row["earned_aero_gross"].as_f64());
     }
 
     #[test]

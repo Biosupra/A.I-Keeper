@@ -1,0 +1,9 @@
+Files the brief says must not change, diff against 46b514a:
+== src/model/shadow.rs: unchanged
+== src/model/regime.rs: unchanged
+== src/claude.rs: unchanged
+== src/guard.rs: unchanged
+== src/rules.rs: unchanged
+== deploy/install.sh: unchanged
+== deploy/aikeeper.service: unchanged
+== tests/guardrails.rs: unchanged

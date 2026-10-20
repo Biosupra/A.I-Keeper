@@ -86,6 +86,9 @@ if [ -f "$ENV" ]; then
   set_var AIK_ANTHROPIC_API_KEY "$(md aik-anthropic-key)"
   # The website's own report (its daily digest and weekly agent test): the same token as the Worker's OPS_REPORT_TOKEN.
   set_var AIK_SITE_REPORT_TOKEN "$(md aik-site-report-token)"
+  # Aero (2026-10-22, docs/AERO-VM-UPDATE.md): the gauge mode (auto | aerodrome | aero) and Aero's AERO/WETH pool.
+  set_var AIK_GAUGE_MODE "$(md aik-gauge-mode)"
+  set_var AIK_AERO_WETH_POOL "$(md aik-aero-weth-pool)"
   chmod 0640 "$ENV" && chgrp aikeeper "$ENV"
 fi
 systemctl restart aikeeper

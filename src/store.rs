@@ -214,6 +214,10 @@ CREATE TABLE IF NOT EXISTS rules_compare (
   old_end REAL, old_rewards REAL, old_moves INTEGER, old_in_range REAL,
   new_end REAL, new_rewards REAL, new_moves INTEGER, new_in_range REAL
 );
+
+-- Aero (2026-10-22): the block each of the followed vault's NFTs was staked at, from the Aero gauge's
+-- `depositBlock(tokenId)` (the early-unstake window is counted in blocks from it).
+CREATE TABLE IF NOT EXISTS aero_stakes (token_id INTEGER PRIMARY KEY, deposit_block INTEGER NOT NULL, ts INTEGER NOT NULL);
 "#;
 
 /// Columns added after a database may already exist on disk (CREATE TABLE IF NOT EXISTS does not
@@ -244,6 +248,24 @@ const MIGRATIONS: &[(&str, &str, &str)] = &[
     ("position_min", "vault", "TEXT NOT NULL DEFAULT 'old'"),
     ("decision_min", "vault", "TEXT NOT NULL DEFAULT 'old'"),
     ("shadow", "vault", "TEXT NOT NULL DEFAULT 'old'"),
+    // Aero (2026-10-22). The raw reads stay as they were; what is really paid is stored next to them:
+    // `reward_rate_effective` = AERO/s actually paid to stakers (Aerodrome: rewardRate(), or 0 once periodFinish
+    // has passed and from the launch; Aero: the LeafVoter's rate net of the referral cut). `gauge_mode` = which
+    // gauge the row was read from. The Aero voter reads: the gross capped rate (AERO/s), the projected cumulative
+    // reward share (wei, exact decimal) and whether the gauge is activated.
+    ("pool_obs", "reward_rate_effective", "REAL"),
+    ("pool_obs", "gauge_mode", "TEXT"),
+    ("pool_obs", "aero_gross_rate", "REAL"),
+    ("pool_obs", "aero_projected_share", "TEXT"),
+    ("pool_obs", "aero_activated", "INTEGER"),
+    // The keeper's per-position gauge `earned` (whole AERO, before Panda's fee) and the NFT's deposit block:
+    // the samples of the measured earned-delta rate.
+    ("position_min", "earned_aero_gross", "REAL"),
+    ("position_min", "deposit_block", "INTEGER"),
+    // Which gauge mode a graded hour ran in ('aerodrome', 'aerodrome-ended' when Aerodrome's rewards ended inside
+    // its window and count as zero from then, 'aero').
+    ("shadow", "gauge_mode", "TEXT"),
+    ("rules_compare", "gauge_mode", "TEXT"),
 ];
 
 pub fn migrate(db: &Connection) -> Result<()> {
