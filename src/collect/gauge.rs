@@ -526,6 +526,11 @@ pub(crate) mod tests {
         };
         let (gauge_impl, g) = abi("gaugeimpl.json");
         let g = functions(&g);
+        // The dump is the verified source of the first Base CLGauge implementation. Aero redeployed Slipstream on
+        // 2026-10-21 (security page): the live implementation is 0x89E91A960154b1ed6c093039a8F0725ab67D14E0 and is
+        // NOT verified on Sourcify. Its bytecode holds every selector below; the only differences found are the
+        // dropped earned(address) aggregate (unused here) and the added emergencyWithdraw(uint256) +
+        // emergencyWithdrawEnabled(). CL_GAUGE_FACTORY in aero.rs is the redeployed factory.
         assert_eq!(gauge_impl, "0x16f866688a306494c612149b48c2fe70ccbe3872");
         check(&g, "earned(address,uint256[])", &["uint256"]);
         check(&g, "voter()", &["address"]);
@@ -551,7 +556,10 @@ pub(crate) mod tests {
         check(&v, "projectedCumulativeRewardShare(address)", &["uint256"]);
         let (factory, f) = abi("gaugefactory.json");
         let f = functions(&f);
-        assert_eq!(factory, aero::CL_GAUGE_FACTORY.to_ascii_lowercase());
+        // Verified dump = the first Base CLGaugeFactory; the redeployed one (2026-10-21) is aero::CL_GAUGE_FACTORY,
+        // unverified, bytecode = all 50 verified functions + the four emergency-withdraw selectors.
+        assert_eq!(factory, "0xa02d1f4e4243ff0d350f478c44b0fd37c7bf848c");
+        assert_eq!(aero::CL_GAUGE_FACTORY.to_ascii_lowercase(), "0xf437f62053acb121665b8fdbfea8f214fb8e589d");
         check(&f, "effectivePenaltyConfig(address)", &["(uint256,uint256)"]);
         check(&f, "emissionCap(address)", &["uint128"]);
         check(&f, "referralConfig(address)", &["address", "uint256"]);

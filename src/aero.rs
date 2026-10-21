@@ -27,7 +27,7 @@ pub const NEW_AERO: &str = "0x3f5bF3EdAc59d650D8fDf9657a71F2f904A3a4Ee";
 /// The LeafVoter CL gauges settle against and the CLGaugeFactory holding the penalty and the cap. The A.I reads
 /// both from the gauge (`voter()`, `gaugeFactory()`); these are the fallbacks when those reads fail.
 pub const LEAF_VOTER: &str = "0x382409fad8503FbCdbB27A4211551fa03e884078";
-pub const CL_GAUGE_FACTORY: &str = "0xa02d1F4E4243ff0d350F478c44B0Fd37c7bF848C";
+pub const CL_GAUGE_FACTORY: &str = "0xf437f62053ACB121665b8fDBfeA8F214FB8E589d";
 
 // ------------------------------------------------------------------------------------ gauge mode
 
