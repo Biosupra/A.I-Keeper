@@ -35,7 +35,7 @@ Aerodrome's gauge and applies the "no rewards after the end" rule on its own.
 
 The Aero WETH/USDC pool and its gauge did not exist yet on 2026-10-20. When they do, find the two addresses:
 
-- pool: `CLFactory.getPool(WETH, USDC, 50)` on CLFactory `0xC6bdE6e9F0CD71013E5FcF2dAAE2fA1c71Bb2F25`
+- pool: `CLFactory.getPool(WETH, USDC, 50)` on CLFactory `0x9CB220581b91b0C83223012FE69688b92aD07a76`
   (WETH `0x4200000000000000000000000000000000000006`, USDC `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`);
 - gauge: `pool.gauge()` on that pool.
 
